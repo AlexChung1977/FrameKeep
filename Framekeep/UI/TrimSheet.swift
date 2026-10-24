@@ -47,14 +47,14 @@ struct TrimSheet: View {
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .frame(minHeight: 320)
+            .frame(minHeight: 280)
             .layoutPriority(1)
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("起點 \(Self.clock(session.start))")
+                    Text("目前片段 起點 \(Self.clock(session.start))")
                     Spacer()
                     Text("終點 \(Self.clock(session.end))")
                 }
@@ -62,22 +62,28 @@ struct TrimSheet: View {
                 .foregroundStyle(FKColor.paperMuted)
                 TrimRangeBar(
                     duration: sliderMax,
-                    start: session.start,
-                    end: session.end,
+                    segments: session.segments.map { ($0.start, $0.end) },
+                    selectedIndex: session.selectedIndex,
                     playhead: session.playhead,
+                    onSelect: { session.selectSegment($0) },
                     onStart: { session.setStart($0, ffmpegPath: app.settings.ffmpegPath) },
                     onEnd: { session.setEnd($0, ffmpegPath: app.settings.ffmpegPath) },
                     onSeek: { session.preview(at: $0, ffmpegPath: app.settings.ffmpegPath) }
                 )
-                Text("片段長度 \(Self.clock(max(0, session.end - session.start)))")
+                Text("共 \(session.segments.count) 段 · 合成後約 \(Self.clock(session.totalLength))")
                     .font(FKFont.body(12))
                     .foregroundStyle(FKColor.amber)
             }
 
+            segmentList
+
             HStack {
                 GhostButton(title: "設為起點") { session.setStartToPlayhead() }
                 GhostButton(title: "設為終點") { session.setEndToPlayhead() }
-                GhostButton(title: "播放選段") { session.playSelection() }
+                GhostButton(title: "播放目前段") { session.playSelection() }
+                if session.segments.count > 1 {
+                    GhostButton(title: "依序預覽") { session.playAllSelections() }
+                }
                 Spacer()
             }
 
@@ -110,8 +116,8 @@ struct TrimSheet: View {
                 .foregroundStyle(FKColor.paper)
                 .disabled(session.exporting)
             Text(session.accurate
-                 ? "會重新編碼，起點和終點較準。"
-                 : "直接裁切，速度快。起點可能對到附近的關鍵幀。")
+                 ? "會重新編碼，起點和終點較準。多段會依序剪下再合成一個檔案。"
+                 : "直接裁切，速度快。起點可能對到附近的關鍵幀。多段會依序剪下再合成一個檔案。")
                 .font(FKFont.body(11))
                 .foregroundStyle(FKColor.paperFaint)
 
@@ -149,8 +155,60 @@ struct TrimSheet: View {
         .onDisappear { session.stop() }
     }
 
+    private var segmentList: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("片段")
+                    .font(FKFont.body(12, weight: .medium))
+                    .foregroundStyle(FKColor.paperMuted)
+                Spacer()
+                GhostButton(title: "新增片段") {
+                    session.addSegment(ffmpegPath: app.settings.ffmpegPath)
+                }
+                .disabled(session.exporting)
+            }
+            ForEach(Array(session.segments.enumerated()), id: \.element.id) { index, segment in
+                HStack(spacing: 8) {
+                    Button {
+                        session.selectSegment(index)
+                        session.preview(at: segment.start, ffmpegPath: app.settings.ffmpegPath)
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("\(index + 1)")
+                                .font(FKFont.body(11, weight: .semibold))
+                                .foregroundStyle(index == session.selectedIndex ? FKColor.graphite : FKColor.paperMuted)
+                                .frame(width: 18, height: 18)
+                                .background(index == session.selectedIndex ? FKColor.amber : Color.white.opacity(0.12))
+                                .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                            Text("\(Self.clock(segment.start)) – \(Self.clock(segment.end))")
+                                .font(FKFont.body(12))
+                                .foregroundStyle(FKColor.paper)
+                            Text(Self.clock(segment.length))
+                                .font(FKFont.body(11))
+                                .foregroundStyle(FKColor.paperMuted)
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(session.exporting)
+
+                    if session.segments.count > 1 {
+                        GhostButton(title: "刪除") {
+                            session.removeSegment(at: index, ffmpegPath: app.settings.ffmpegPath)
+                        }
+                        .disabled(session.exporting)
+                    }
+                }
+                .padding(.vertical, 2)
+            }
+        }
+    }
+
     private var canExport: Bool {
-        !session.exporting && session.end - session.start >= 0.1 && session.item.exists
+        !session.exporting
+            && session.item.exists
+            && session.segments.contains(where: { $0.length >= 0.1 })
     }
 
     private var sliderMax: Double {
@@ -168,7 +226,7 @@ struct TrimSheet: View {
     }
 
     private var outputLocationCaption: String {
-        "檔案會存到 \(resolvedOutputDirectory.path)，並出現在媒體庫。"
+        "多段會合成為單一檔案，存到 \(resolvedOutputDirectory.path)，並出現在媒體庫。"
     }
 
     private func chooseOutputFolder() {
@@ -198,11 +256,11 @@ struct TrimSheet: View {
         session.error = nil
         session.player.pause()
         do {
+            let segments = session.segments.filter { $0.length >= 0.1 }
             let file = try await VideoTrimmer.export(
                 VideoTrimmer.Request(
                     source: session.item.fileURL,
-                    start: session.start,
-                    end: session.end,
+                    segments: segments,
                     ffmpegPath: app.settings.ffmpegPath,
                     accurate: session.accurate
                 ),
@@ -216,7 +274,7 @@ struct TrimSheet: View {
                     session.progress = fraction
                 }
             }
-            let duration = session.end - session.start
+            let duration = segments.reduce(0) { $0 + $1.length }
             let saved = try library.commitTrim(
                 of: session.item,
                 file: file,
@@ -244,9 +302,10 @@ struct TrimSheet: View {
 
 private struct TrimRangeBar: View {
     var duration: Double
-    var start: Double
-    var end: Double
+    var segments: [(Double, Double)]
+    var selectedIndex: Int
     var playhead: Double
+    var onSelect: (Int) -> Void
     var onStart: (Double) -> Void
     var onEnd: (Double) -> Void
     var onSeek: (Double) -> Void
@@ -262,9 +321,11 @@ private struct TrimRangeBar: View {
             let inset: CGFloat = 7
             let track = max(width - inset * 2, 1)
             let span = max(duration, 0.2)
-            let startX = inset + track * CGFloat(min(max(start, 0), span) / span)
-            let endX = inset + track * CGFloat(min(max(end, 0), span) / span)
             let playX = inset + track * CGFloat(min(max(playhead, 0), span) / span)
+            let selected = segments.indices.contains(selectedIndex) ? segments[selectedIndex] : nil
+            let startX = selected.map { inset + track * CGFloat(min(max($0.0, 0), span) / span) } ?? inset
+            let endX = selected.map { inset + track * CGFloat(min(max($0.1, 0), span) / span) } ?? inset
+
             ZStack(alignment: .leading) {
                 Color.clear
                     .contentShape(Rectangle())
@@ -272,7 +333,11 @@ private struct TrimRangeBar: View {
                         DragGesture(minimumDistance: 0)
                             .onEnded { value in
                                 let x = min(max(value.location.x - inset, 0), track)
-                                onSeek(span * Double(x / track))
+                                let seconds = span * Double(x / track)
+                                if let hit = hitSegment(at: seconds) {
+                                    onSelect(hit)
+                                }
+                                onSeek(seconds)
                             }
                     )
                 Capsule()
@@ -280,22 +345,31 @@ private struct TrimRangeBar: View {
                     .frame(height: 8)
                     .padding(.horizontal, inset)
                     .allowsHitTesting(false)
-                Capsule()
-                    .fill(FKColor.amber)
-                    .frame(width: max(endX - startX, 4), height: 8)
-                    .offset(x: startX)
-                    .allowsHitTesting(false)
+
+                ForEach(Array(segments.enumerated()), id: \.offset) { index, segment in
+                    let sX = inset + track * CGFloat(min(max(segment.0, 0), span) / span)
+                    let eX = inset + track * CGFloat(min(max(segment.1, 0), span) / span)
+                    Capsule()
+                        .fill(index == selectedIndex ? FKColor.amber : FKColor.amber.opacity(0.35))
+                        .frame(width: max(eX - sX, 4), height: 8)
+                        .offset(x: sX)
+                        .allowsHitTesting(false)
+                }
+
                 Rectangle()
                     .fill(Color.white.opacity(0.9))
                     .frame(width: 2, height: 18)
                     .offset(x: playX - 1)
                     .allowsHitTesting(false)
-                handle
-                    .position(x: startX, y: geo.size.height / 2)
-                    .highPriorityGesture(dragGesture(.start, track: track, span: span))
-                handle
-                    .position(x: endX, y: geo.size.height / 2)
-                    .highPriorityGesture(dragGesture(.end, track: track, span: span))
+
+                if selected != nil {
+                    handle
+                        .position(x: startX, y: geo.size.height / 2)
+                        .highPriorityGesture(dragGesture(.start, track: track, span: span))
+                    handle
+                        .position(x: endX, y: geo.size.height / 2)
+                        .highPriorityGesture(dragGesture(.end, track: track, span: span))
+                }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -312,12 +386,22 @@ private struct TrimRangeBar: View {
             )
     }
 
+    private func hitSegment(at seconds: Double) -> Int? {
+        for (index, segment) in segments.enumerated().reversed() {
+            if seconds >= segment.0 && seconds <= segment.1 {
+                return index
+            }
+        }
+        return nil
+    }
+
     private func dragGesture(_ edge: DragEdge, track: CGFloat, span: Double) -> some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
                 if drag != edge {
                     drag = edge
-                    dragOrigin = edge == .start ? start : end
+                    guard segments.indices.contains(selectedIndex) else { return }
+                    dragOrigin = edge == .start ? segments[selectedIndex].0 : segments[selectedIndex].1
                 }
                 let next = dragOrigin + Double(value.translation.width / track) * span
                 if edge == .start {
@@ -355,8 +439,8 @@ final class TrimSession: ObservableObject {
     let item: MediaItem
     let player: AVPlayer
     @Published var duration: Double
-    @Published var start: Double = 0
-    @Published var end: Double
+    @Published var segments: [VideoTrimmer.Segment]
+    @Published var selectedIndex: Int = 0
     @Published var playhead: Double = 0
     @Published var outputTitle: String
     @Published var accurate = false
@@ -369,16 +453,33 @@ final class TrimSession: ObservableObject {
 
     private var timeToken: Any?
     private var playingSelection = false
+    private var playQueue: [VideoTrimmer.Segment] = []
+    private var activePlayEnd: Double?
     private var scrubRequested: Double?
     private var scrubLabel = "起點"
     private var scrubInFlight = false
     private var scrubStopped = false
 
+    var start: Double {
+        guard segments.indices.contains(selectedIndex) else { return 0 }
+        return segments[selectedIndex].start
+    }
+
+    var end: Double {
+        guard segments.indices.contains(selectedIndex) else { return 0 }
+        return segments[selectedIndex].end
+    }
+
+    var totalLength: TimeInterval {
+        segments.reduce(0) { $0 + $1.length }
+    }
+
     init(item: MediaItem) {
         self.item = item
         let known = item.duration ?? 0
         duration = known
-        end = known > 0 ? known : 0
+        let end = known > 0 ? known : 0
+        segments = [VideoTrimmer.Segment(start: 0, end: end)]
         outputTitle = "\(item.title) 剪接"
         player = AVPlayer(url: item.fileURL)
     }
@@ -393,9 +494,17 @@ final class TrimSession: ObservableObject {
             Task { @MainActor in
                 guard let self, seconds.isFinite else { return }
                 self.playhead = seconds
-                if self.playingSelection, seconds >= self.end {
-                    self.player.pause()
-                    self.playingSelection = false
+                guard self.playingSelection, let limit = self.activePlayEnd else { return }
+                if seconds >= limit {
+                    if let next = self.playQueue.first {
+                        self.playQueue.removeFirst()
+                        self.activePlayEnd = next.end
+                        self.seekAndPlay(from: next.start)
+                    } else {
+                        self.activePlayEnd = nil
+                        self.player.pause()
+                        self.playingSelection = false
+                    }
                 }
             }
         }
@@ -404,19 +513,49 @@ final class TrimSession: ObservableObject {
     func loadDuration(using library: LibraryService) async {
         guard let loaded = await library.readDuration(of: item.fileURL), loaded > 0.1 else { return }
         duration = loaded
-        if end <= 0 || end > loaded { end = loaded }
+        if segments.count == 1, segments[0].end <= 0 || segments[0].end > loaded {
+            segments[0].end = loaded
+        }
+    }
+
+    func selectSegment(_ index: Int) {
+        guard segments.indices.contains(index) else { return }
+        selectedIndex = index
+    }
+
+    func addSegment(ffmpegPath: String) {
+        let span = duration > 0 ? duration : max(end, 1)
+        let preferredStart = min(max(0, playhead), max(0, span - 0.1))
+        var nextStart = preferredStart
+        var nextEnd = min(span, preferredStart + max(1, span * 0.1))
+        if nextEnd - nextStart < 0.1 {
+            nextStart = max(0, span - 1)
+            nextEnd = span
+        }
+        segments.append(VideoTrimmer.Segment(start: nextStart, end: nextEnd))
+        selectedIndex = segments.count - 1
+        scheduleScrub(at: nextStart, label: "起點", ffmpegPath: ffmpegPath)
+    }
+
+    func removeSegment(at index: Int, ffmpegPath: String) {
+        guard segments.count > 1, segments.indices.contains(index) else { return }
+        segments.remove(at: index)
+        selectedIndex = min(selectedIndex, segments.count - 1)
+        scheduleScrub(at: start, label: "起點", ffmpegPath: ffmpegPath)
     }
 
     func setStart(_ value: Double, ffmpegPath: String) {
-        let next = min(max(0, value), max(0, end - 0.1))
-        start = next
+        guard segments.indices.contains(selectedIndex) else { return }
+        let next = min(max(0, value), max(0, segments[selectedIndex].end - 0.1))
+        segments[selectedIndex].start = next
         playhead = next
         scheduleScrub(at: next, label: "起點", ffmpegPath: ffmpegPath)
     }
 
     func setEnd(_ value: Double, ffmpegPath: String) {
-        let next = min(max(start + 0.1, value), duration > 0 ? duration : value)
-        end = next
+        guard segments.indices.contains(selectedIndex) else { return }
+        let next = min(max(segments[selectedIndex].start + 0.1, value), duration > 0 ? duration : value)
+        segments[selectedIndex].end = next
         playhead = next
         scheduleScrub(at: next, label: "終點", ffmpegPath: ffmpegPath)
     }
@@ -443,6 +582,8 @@ final class TrimSession: ObservableObject {
     func scheduleScrub(at seconds: Double, label: String, ffmpegPath: String) {
         player.pause()
         playingSelection = false
+        playQueue = []
+        activePlayEnd = nil
         seek(to: seconds)
         scrubRequested = seconds
         scrubLabel = label
@@ -471,14 +612,22 @@ final class TrimSession: ObservableObject {
     }
 
     func playSelection() {
+        guard segments.indices.contains(selectedIndex) else { return }
         scrubImage = nil
         playingSelection = true
-        let target = CMTime(seconds: start, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            Task { @MainActor in
-                self?.player.play()
-            }
-        }
+        playQueue = []
+        activePlayEnd = segments[selectedIndex].end
+        seekAndPlay(from: segments[selectedIndex].start)
+    }
+
+    func playAllSelections() {
+        let queue = segments.filter { $0.length >= 0.1 }
+        guard let first = queue.first else { return }
+        scrubImage = nil
+        playingSelection = true
+        playQueue = Array(queue.dropFirst())
+        activePlayEnd = first.end
+        seekAndPlay(from: first.start)
     }
 
     func cancelExport() {
@@ -490,9 +639,21 @@ final class TrimSession: ObservableObject {
     func stop() {
         scrubStopped = true
         player.pause()
+        playingSelection = false
+        playQueue = []
+        activePlayEnd = nil
         if let timeToken {
             player.removeTimeObserver(timeToken)
             self.timeToken = nil
+        }
+    }
+
+    private func seekAndPlay(from seconds: Double) {
+        let target = CMTime(seconds: seconds, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            Task { @MainActor in
+                self?.player.play()
+            }
         }
     }
 
