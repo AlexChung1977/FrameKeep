@@ -1,0 +1,64 @@
+name: Framekeep
+options:
+  bundleIdPrefix: app.framekeep
+  deploymentTarget:
+    macOS: "13.0"
+  developmentLanguage: zh-Hant
+  createIntermediateGroups: true
+  xcodeVersion: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    COMBINE_HIDPI_IMAGES: YES
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+targets:
+  Framekeep:
+    type: application
+    platform: macOS
+    sources:
+      - path: Framekeep
+        excludes:
+          - "**/*.entitlements"
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_NAME: Framekeep
+        PRODUCT_BUNDLE_IDENTIFIER: app.framekeep.Framekeep
+        INFOPLIST_FILE: Framekeep/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Framekeep/Framekeep.entitlements
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: NO
+        COMBINE_HIDPI_IMAGES: YES
+        OTHER_LDFLAGS: "$(inherited) -lsqlite3"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+        SWIFT_EMIT_LOC_STRINGS: YES
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    info:
+      path: Framekeep/Info.plist
+      properties:
+        CFBundleDisplayName: Framekeep
+        LSApplicationCategoryType: public.app-category.video
+    entitlements:
+      path: Framekeep/Framekeep.entitlements
+    scheme:
+      testTargets: []
+schemes:
+  Framekeep:
+    build:
+      targets:
+        Framekeep: all
+    run:
+      config: Debug
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
