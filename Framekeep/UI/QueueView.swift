@@ -5,22 +5,35 @@ struct QueueView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var queue: DownloadQueueService
     @EnvironmentObject private var settings: AppSettings
+    @State private var selection = Set<DownloadJob.ID>()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             if queue.jobs.isEmpty {
                 Spacer()
-                EmptyStateView(title: "佇列是空的", detail: "從首頁貼上連結後，任務會出現在這裡。")
+                EmptyStateView(title: "佇列是空的", detail: "貼上連結後，下載會出現在這裡。")
                 Spacer()
             } else {
-                List(queue.jobs) { job in
-                    QueueRow(job: job)
-                        .listRowBackground(FKColor.graphiteElevated)
-                        .listRowSeparatorTint(FKColor.line)
+                List(selection: $selection) {
+                    ForEach(queue.jobs) { job in
+                        QueueRow(job: job)
+                            .tag(job.id)
+                            .listRowBackground(FKColor.graphiteElevated)
+                            .listRowSeparatorTint(FKColor.line)
+                    }
                 }
                 .scrollContentBackground(.hidden)
                 .listStyle(.inset)
+                .contextMenu(forSelectionType: DownloadJob.ID.self) { ids in
+                    Button(ids.count > 1 ? "移除所選 \(ids.count) 項" : "移除", role: .destructive) {
+                        remove(ids)
+                    }
+                    .disabled(ids.isEmpty)
+                } primaryAction: { _ in }
+                .onDeleteCommand {
+                    remove(selection)
+                }
             }
         }
         .background(FKColor.graphite)
@@ -32,12 +45,23 @@ struct QueueView: View {
                 .font(FKFont.display(22, weight: .semibold))
                 .foregroundStyle(FKColor.paper)
             Spacer()
+            if !selection.isEmpty {
+                GhostButton(title: "移除所選 \(selection.count) 項") {
+                    remove(selection)
+                }
+            }
             Text("並行 \(settings.concurrency)")
                 .font(FKFont.body(11))
                 .foregroundStyle(FKColor.paperFaint)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    private func remove(_ ids: Set<DownloadJob.ID>) {
+        guard !ids.isEmpty else { return }
+        selection.subtract(ids)
+        app.removeFromQueue(ids)
     }
 }
 
@@ -57,8 +81,8 @@ private struct QueueRow: View {
                     .font(FKFont.body(11, weight: .medium))
                     .foregroundStyle(statusColor)
             }
-            if let format = job.formatLabel {
-                Text(format)
+            if let detail = mediaDetail {
+                Text(detail)
                     .font(FKFont.body(11))
                     .foregroundStyle(FKColor.paperMuted)
             }
@@ -102,6 +126,13 @@ private struct QueueRow: View {
             }
         }
         .padding(.vertical, 6)
+        .task(id: job.outputPath) {
+            await app.queue.refreshFileDetail(job)
+        }
+    }
+
+    private var mediaDetail: String? {
+        job.formatLabel
     }
 
     private var statusColor: Color {

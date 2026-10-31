@@ -21,10 +21,10 @@ enum DefaultFormatPreset: String, CaseIterable, Identifiable, Codable {
 
     var subtitle: String {
         switch self {
-        case .best: return "優先最高解析度，必要時合併影音軌"
+        case .best: return "優先最高解析度；同一解析度先選 AV1，再選畫質較好的編碼"
         case .balanced: return "約 720p，較省時間與空間"
         case .audioOnly: return "只保留音訊（m4a／opus）"
-        case .custom: return "每次手動選格式"
+        case .custom: return "使用解析結果裡畫質最高的格式"
         }
     }
 

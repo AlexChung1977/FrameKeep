@@ -48,7 +48,7 @@ struct QualityPickerView: View {
                                             VStack(alignment: .leading, spacing: 2) {
                                                 Text(format.label)
                                                     .foregroundStyle(FKColor.paper)
-                                                Text(format.codecLabel)
+                                                Text(formatLine(format))
                                                     .font(FKFont.body(11))
                                                     .foregroundStyle(FKColor.paperMuted)
                                             }
@@ -70,7 +70,7 @@ struct QualityPickerView: View {
                         .frame(minHeight: 180, maxHeight: 240)
                     }
                 } else if let pick = app.pickerCustom {
-                    Text("將使用：\(pick.selectionLabel)")
+                    Text("將使用：\(pick.technicalLabel.isEmpty ? pick.selectionLabel : pick.technicalLabel)\(pick.isVideoOnly ? "（會合併音訊）" : "")")
                         .font(FKFont.body(12))
                         .foregroundStyle(FKColor.amber)
                 }
@@ -103,5 +103,13 @@ struct QualityPickerView: View {
         .padding(22)
         .frame(minWidth: 520, minHeight: 320)
         .background(FKColor.graphite)
+    }
+
+    private func formatLine(_ format: MediaFormat) -> String {
+        var parts: [String] = []
+        let codec = format.codecLabel
+        if codec != "—" { parts.append(codec) }
+        if let fps = format.fpsLabel { parts.append(fps) }
+        return parts.joined(separator: " · ")
     }
 }

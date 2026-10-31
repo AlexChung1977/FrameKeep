@@ -12,6 +12,7 @@ final class DownloadQueueService: ObservableObject {
     private var running: [UUID: Task<Void, Never>] = [:]
     private var handles: [UUID: ProcessRunner.Handle] = [:]
     private var pausedIDs = Set<UUID>()
+    private var removedIDs = Set<UUID>()
 
     init(store: JobStore, settings: AppSettings) {
         self.store = store
@@ -90,6 +91,34 @@ final class DownloadQueueService: ObservableObject {
         pump(ytdlp: ytdlp, ffmpeg: ffmpeg, library: library)
     }
 
+    func remove(_ job: DownloadJob) {
+        removedIDs.insert(job.id)
+        running[job.id]?.cancel()
+        handles[job.id]?.terminate()
+        running[job.id] = nil
+        handles[job.id] = nil
+        pausedIDs.remove(job.id)
+        jobs.removeAll { $0.id == job.id }
+        try? store.delete(id: job.id)
+        let work = AppPaths.incompleteDirectory(root: settings.moviesRootURL)
+            .appendingPathComponent(job.id.uuidString, isDirectory: true)
+        try? FileManager.default.removeItem(at: work)
+    }
+
+    func refreshFileDetail(_ job: DownloadJob) async {
+        guard job.state == .completed, let path = job.outputPath else { return }
+        if let label = job.formatLabel {
+            if label.hasPrefix("音訊") { return }
+            if label.contains("×"), label.contains("FPS") { return }
+        }
+        guard FileManager.default.fileExists(atPath: path) else { return }
+        guard let ffmpeg = VideoThumbnail.ffmpegExecutable(preferred: settings.ffmpegPath) else { return }
+        guard let label = await MediaFileInfo.label(for: URL(fileURLWithPath: path), ffmpeg: ffmpeg) else { return }
+        guard var current = jobs.first(where: { $0.id == job.id }), !removedIDs.contains(job.id) else { return }
+        current.formatLabel = label
+        upsert(current)
+    }
+
     func cancel(_ job: DownloadJob) {
         running[job.id]?.cancel()
         handles[job.id]?.terminate()
@@ -162,6 +191,7 @@ final class DownloadQueueService: ObservableObject {
             try AppPaths.ensureDirectory(work)
             try AppPaths.ensureStandardLayout(root: settings.moviesRootURL)
             let format = job.formatID ?? settings.defaultFormat.ytDlpFormat
+            let formatSort = FormatSelector.ytDlpSort(for: format)
             let template = settings.filenameTemplate.isEmpty
                 ? "%(title)s [%(id)s].%(ext)s"
                 : settings.filenameTemplate
@@ -171,6 +201,7 @@ final class DownloadQueueService: ObservableObject {
             let downloaded = try await client.download(
                 url: job.url,
                 format: format,
+                formatSort: formatSort,
                 outputTemplate: template,
                 workDirectory: work,
                 cookies: settings.cookieFileURL,
@@ -251,7 +282,7 @@ final class DownloadQueueService: ObservableObject {
             if job.state == .probing {
                 recovered.state = .failed
                 recovered.failureKind = .parseFailed
-                recovered.failureMessage = "上次解析被中斷，請回到首頁再試。"
+                recovered.failureMessage = "上次解析被中斷，請再貼上連結。"
             } else {
                 recovered.state = .queued
                 recovered.failureMessage = nil
@@ -262,6 +293,7 @@ final class DownloadQueueService: ObservableObject {
     }
 
     private func upsert(_ job: DownloadJob) {
+        guard !removedIDs.contains(job.id) else { return }
         if let index = jobs.firstIndex(where: { $0.id == job.id }) {
             jobs[index] = job
         } else {

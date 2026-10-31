@@ -1,6 +1,7 @@
 xcuserdata/
 DerivedData/
 .build/
+dist/
 *.xcuserstate
 *.moved-aside
 .DS_Store

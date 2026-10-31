@@ -140,6 +140,85 @@ enum VideoTrimmer {
         return data
     }
 
+    static func makePreview(url: URL, segments: [Segment], ffmpegPath: String) async -> URL? {
+        guard let ffmpeg = VideoThumbnail.ffmpegExecutable(preferred: ffmpegPath) else { return nil }
+        let pieces = segments.filter { $0.length >= 0.1 }
+        guard !pieces.isEmpty, FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let dest = FileManager.default.temporaryDirectory
+            .appendingPathComponent("framekeep-preview-\(UUID().uuidString).mp4")
+        let budget = max(45, pieces.reduce(0) { $0 + $1.length } * 1.5)
+        if await renderPreview(url: url, pieces: pieces, dest: dest, ffmpeg: ffmpeg, audio: true, timeout: budget) {
+            return dest
+        }
+        if Task.isCancelled { return nil }
+        try? FileManager.default.removeItem(at: dest)
+        if await renderPreview(url: url, pieces: pieces, dest: dest, ffmpeg: ffmpeg, audio: false, timeout: budget) {
+            return dest
+        }
+        try? FileManager.default.removeItem(at: dest)
+        return nil
+    }
+
+    private static func renderPreview(
+        url: URL,
+        pieces: [Segment],
+        dest: URL,
+        ffmpeg: URL,
+        audio: Bool,
+        timeout: TimeInterval
+    ) async -> Bool {
+        let result = try? await ProcessRunner.run(
+            executable: ffmpeg,
+            arguments: previewArguments(url: url, pieces: pieces, dest: dest, audio: audio),
+            timeout: timeout
+        )
+        let size = (try? FileManager.default.attributesOfItem(atPath: dest.path)[.size] as? NSNumber)?.intValue ?? 0
+        guard !Task.isCancelled, result?.exitCode == 0, size > 0 else { return false }
+        return true
+    }
+
+    private static func previewArguments(url: URL, pieces: [Segment], dest: URL, audio: Bool) -> [String] {
+        var args = ["-y"]
+        for piece in pieces {
+            args += ["-ss", time(piece.start), "-t", time(piece.length), "-i", url.path]
+        }
+        if pieces.count == 1 {
+            args += ["-vf", "scale=960:-2", "-map", "0:v:0"]
+            if audio {
+                args += ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k", "-ac", "2"]
+            } else {
+                args += ["-an"]
+            }
+        } else {
+            var filters: [String] = []
+            var videoInputs: [String] = []
+            for index in pieces.indices {
+                filters.append("[\(index):v:0]scale=960:-2,setsar=1[v\(index)]")
+                videoInputs.append("[v\(index)]")
+                if audio {
+                    filters.append("[\(index):a:0]aformat=sample_rates=48000:channel_layouts=stereo[a\(index)]")
+                }
+            }
+            if audio {
+                let pairs = pieces.indices.map { "[v\($0)][a\($0)]" }.joined()
+                filters.append("\(pairs)concat=n=\(pieces.count):v=1:a=1[v][a]")
+                args += ["-filter_complex", filters.joined(separator: ";"), "-map", "[v]", "-map", "[a]", "-c:a", "aac", "-b:a", "128k"]
+            } else {
+                filters.append("\(videoInputs.joined())concat=n=\(pieces.count):v=1:a=0[v]")
+                args += ["-filter_complex", filters.joined(separator: ";"), "-map", "[v]", "-an"]
+            }
+        }
+        args += [
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+            dest.path
+        ]
+        return args
+    }
+
     private static let audioExtensions: Set<String> = ["m4a", "mp3", "aac", "opus", "wav", "flac"]
 
     private static func exportSingle(

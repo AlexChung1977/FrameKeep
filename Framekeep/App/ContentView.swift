@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var app: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         NavigationSplitView {
@@ -18,11 +19,6 @@ struct ContentView: View {
         .environmentObject(app.capture)
         .environmentObject(app.toolchain)
         .tint(FKColor.amber)
-        .sheet(isPresented: $app.showingPicker) {
-            QualityPickerView()
-                .environmentObject(app)
-                .environmentObject(app.queue)
-        }
         .sheet(isPresented: $app.showingSetup) {
             SetupRequiredView()
                 .environmentObject(app)
@@ -32,6 +28,19 @@ struct ContentView: View {
         .task {
             await app.bootstrap()
         }
+        .onAppear {
+            presentTrimWindowIfNeeded()
+        }
+        .onChange(of: app.trimRequest) { _ in
+            presentTrimWindowIfNeeded()
+        }
+        .background(WindowIdentity(id: "framekeep.main"))
+    }
+
+    private func presentTrimWindowIfNeeded() {
+        guard app.trimRequest > 0 else { return }
+        openWindow(id: "trim")
+        TrimWindowFocus.orderFront(closeMain: app.takeCloseMainAfterTrim())
     }
 
     private var sidebar: some View {
@@ -66,8 +75,6 @@ struct ContentView: View {
         switch app.selected {
         case .home:
             HomeView()
-        case .queue:
-            QueueView()
         case .library:
             LibraryView()
         case .capture:

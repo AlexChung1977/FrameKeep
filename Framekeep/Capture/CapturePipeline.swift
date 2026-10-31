@@ -321,7 +321,7 @@ final class CapturePipeline: NSObject, ObservableObject {
         do {
             try AppPaths.ensureDirectory(AppPaths.incompleteDirectory(root: root))
             let url = AppPaths.incompleteDirectory(root: root)
-                .appendingPathComponent("capture-\(UUID().uuidString).mov")
+                .appendingPathComponent("capture-\(UUID().uuidString).mp4")
             try await ensureStreamForSelection()
             try prepareWriter(url: url)
             recording = true
@@ -570,7 +570,8 @@ final class CapturePipeline: NSObject, ObservableObject {
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        writer.shouldOptimizeForNetworkUse = true
         writerLock.lock()
         self.writer = writer
         self.videoInput = nil
@@ -960,7 +961,7 @@ final class CapturePipeline: NSObject, ObservableObject {
             }
             return video
         }
-        let muxed = video.deletingLastPathComponent().appendingPathComponent(video.deletingPathExtension().lastPathComponent + "-mix.mov")
+        let muxed = video.deletingLastPathComponent().appendingPathComponent(video.deletingPathExtension().lastPathComponent + "-mix.mp4")
         var arguments = ["-y", "-i", video.path]
         tracks.forEach { arguments += ["-i", $0.path] }
         if tracks.count == 1 {

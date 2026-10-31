@@ -14,25 +14,37 @@ struct TrimSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("剪接")
-                .font(FKFont.display(18, weight: .semibold))
-                .foregroundStyle(FKColor.paper)
+            HStack(alignment: .firstTextBaseline) {
+                Text("剪接")
+                    .font(FKFont.display(18, weight: .semibold))
+                    .foregroundStyle(FKColor.paper)
+                Spacer()
+                GhostButton(title: "選擇影片") { app.chooseTrimVideo() }
+            }
             Text(session.item.title)
                 .font(FKFont.body(12))
                 .foregroundStyle(FKColor.paperMuted)
                 .lineLimit(1)
+            Text("可以把別的影片拖進這個視窗。")
+                .font(FKFont.body(11))
+                .foregroundStyle(FKColor.paperFaint)
 
             ZStack {
-                PlayerHost(player: session.player)
-                if let image = session.scrubImage {
+                Color.black
+                if session.isPlayingPreview {
+                    PlayerHost(player: session.player)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if let image = session.scrubImage {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .background(Color.black)
+                        .id(session.scrubRevision)
+                }
+                if !session.isPlayingPreview {
                     VStack {
                         HStack {
-                            Text(session.scrubCaption)
+                            Text(session.scrubCaption.isEmpty ? "正在讀取預覽…" : session.scrubCaption)
                                 .font(FKFont.body(11, weight: .medium))
                                 .foregroundStyle(FKColor.paper)
                                 .padding(.horizontal, 8)
@@ -44,6 +56,7 @@ struct TrimSheet: View {
                         Spacer()
                     }
                     .padding(8)
+                    .allowsHitTesting(false)
                 }
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -80,9 +93,13 @@ struct TrimSheet: View {
             HStack {
                 GhostButton(title: "設為起點") { session.setStartToPlayhead() }
                 GhostButton(title: "設為終點") { session.setEndToPlayhead() }
-                GhostButton(title: "播放目前段") { session.playSelection() }
+                GhostButton(title: "播放目前段") {
+                    session.playSelection(ffmpegPath: app.settings.ffmpegPath)
+                }
                 if session.segments.count > 1 {
-                    GhostButton(title: "依序預覽") { session.playAllSelections() }
+                    GhostButton(title: "依序預覽") {
+                        session.playAllSelections(ffmpegPath: app.settings.ffmpegPath)
+                    }
                 }
                 Spacer()
             }
@@ -150,6 +167,7 @@ struct TrimSheet: View {
         .task {
             session.observePlayback()
             await session.loadDuration(using: library)
+            await session.loadPlaybackMode()
             session.scheduleScrub(at: session.start, label: "起點", ffmpegPath: app.settings.ffmpegPath)
         }
         .onDisappear { session.stop() }
@@ -449,15 +467,26 @@ final class TrimSession: ObservableObject {
     @Published var error: String?
     @Published var scrubImage: NSImage?
     @Published var scrubCaption = ""
+    @Published var scrubRevision = 0
+    @Published var isPlayingPreview = false
     var exportHandle: ProcessRunner.Handle?
 
     private var timeToken: Any?
     private var playingSelection = false
     private var playQueue: [VideoTrimmer.Segment] = []
     private var activePlayEnd: Double?
+    private var playToken = 0
+    private var acceptPlaybackTime = false
+    private var nativePlayback = true
+    private var playbackModeLoaded = false
+    private var proxyPlayback = false
+    private var proxyOrigin: [(sourceStart: Double, length: Double)] = []
+    private var proxyTask: Task<Void, Never>?
+    private var proxyURL: URL?
     private var scrubRequested: Double?
     private var scrubLabel = "起點"
     private var scrubInFlight = false
+    private var scrubGeneration = 0
     private var scrubStopped = false
 
     var start: Double {
@@ -493,21 +522,32 @@ final class TrimSession: ObservableObject {
             let seconds = time.seconds
             Task { @MainActor in
                 guard let self, seconds.isFinite else { return }
+                guard self.playingSelection, self.acceptPlaybackTime else { return }
+                if self.proxyPlayback {
+                    self.playhead = self.sourceTime(forProxy: seconds)
+                    return
+                }
                 self.playhead = seconds
-                guard self.playingSelection, let limit = self.activePlayEnd else { return }
-                if seconds >= limit {
-                    if let next = self.playQueue.first {
-                        self.playQueue.removeFirst()
-                        self.activePlayEnd = next.end
-                        self.seekAndPlay(from: next.start)
-                    } else {
-                        self.activePlayEnd = nil
-                        self.player.pause()
-                        self.playingSelection = false
-                    }
+                guard let limit = self.activePlayEnd, seconds >= limit - 0.05 else { return }
+                if let next = self.playQueue.first {
+                    self.playQueue.removeFirst()
+                    self.activePlayEnd = next.end
+                    self.seekAndPlay(from: next.start)
+                } else {
+                    self.activePlayEnd = nil
+                    self.player.pause()
+                    self.playingSelection = false
+                    self.acceptPlaybackTime = false
                 }
             }
         }
+    }
+
+    func loadPlaybackMode() async {
+        guard !playbackModeLoaded else { return }
+        let asset = AVURLAsset(url: item.fileURL)
+        nativePlayback = (try? await asset.load(.isPlayable)) ?? false
+        playbackModeLoaded = true
     }
 
     func loadDuration(using library: LibraryService) async {
@@ -568,66 +608,67 @@ final class TrimSession: ObservableObject {
     }
 
     func setStartToPlayhead() {
-        let seconds = player.currentTime().seconds
-        guard seconds.isFinite else { return }
-        setStart(seconds, ffmpegPath: "")
+        setStart(playhead, ffmpegPath: "")
     }
 
     func setEndToPlayhead() {
-        let seconds = player.currentTime().seconds
-        guard seconds.isFinite else { return }
-        setEnd(seconds, ffmpegPath: "")
+        setEnd(playhead, ffmpegPath: "")
     }
 
     func scheduleScrub(at seconds: Double, label: String, ffmpegPath: String) {
+        if playingSelection || isPlayingPreview || proxyTask != nil {
+            cancelPreviewPlayback()
+        }
         player.pause()
-        playingSelection = false
-        playQueue = []
-        activePlayEnd = nil
-        seek(to: seconds)
+        if nativePlayback {
+            seek(to: seconds)
+        }
         scrubRequested = seconds
         scrubLabel = label
         scrubCaption = "\(label) \(Self.clock(seconds))"
         guard !scrubInFlight else { return }
         scrubInFlight = true
+        scrubGeneration += 1
+        let generation = scrubGeneration
         let source = item.fileURL
         Task {
-            while !scrubStopped, let target = scrubRequested {
+            defer {
+                if generation == self.scrubGeneration {
+                    self.scrubInFlight = false
+                }
+            }
+            while generation == scrubGeneration, !scrubStopped {
+                guard let target = scrubRequested else { break }
                 let caption = "\(scrubLabel) \(Self.clock(target))"
                 scrubRequested = nil
                 let data = await VideoTrimmer.previewJPEG(url: source, seconds: target, ffmpegPath: ffmpegPath)
-                guard !scrubStopped else { break }
+                guard generation == scrubGeneration, !scrubStopped else { return }
                 if scrubRequested != nil { continue }
                 if let data, let image = NSImage(data: data) {
                     scrubImage = image
                     scrubCaption = caption
+                    scrubRevision += 1
                 }
                 if scrubRequested == nil { break }
             }
-            scrubInFlight = false
-            if scrubRequested != nil, !scrubStopped {
+            if generation == scrubGeneration, scrubRequested != nil, !scrubStopped {
+                scrubInFlight = false
                 scheduleScrub(at: scrubRequested ?? seconds, label: scrubLabel, ffmpegPath: ffmpegPath)
             }
         }
     }
 
-    func playSelection() {
+    func playSelection(ffmpegPath: String) {
         guard segments.indices.contains(selectedIndex) else { return }
-        scrubImage = nil
-        playingSelection = true
-        playQueue = []
-        activePlayEnd = segments[selectedIndex].end
-        seekAndPlay(from: segments[selectedIndex].start)
+        let segment = segments[selectedIndex]
+        guard segment.length >= 0.1 else { return }
+        startPreview(segments: [segment], ffmpegPath: ffmpegPath)
     }
 
-    func playAllSelections() {
+    func playAllSelections(ffmpegPath: String) {
         let queue = segments.filter { $0.length >= 0.1 }
-        guard let first = queue.first else { return }
-        scrubImage = nil
-        playingSelection = true
-        playQueue = Array(queue.dropFirst())
-        activePlayEnd = first.end
-        seekAndPlay(from: first.start)
+        guard !queue.isEmpty else { return }
+        startPreview(segments: queue, ffmpegPath: ffmpegPath)
     }
 
     func cancelExport() {
@@ -638,21 +679,119 @@ final class TrimSession: ObservableObject {
 
     func stop() {
         scrubStopped = true
+        cancelPreviewPlayback()
         player.pause()
-        playingSelection = false
-        playQueue = []
-        activePlayEnd = nil
+        if let proxyURL {
+            try? FileManager.default.removeItem(at: proxyURL)
+            self.proxyURL = nil
+        }
         if let timeToken {
             player.removeTimeObserver(timeToken)
             self.timeToken = nil
         }
     }
 
+    private func startPreview(segments queue: [VideoTrimmer.Segment], ffmpegPath: String) {
+        Task {
+            if !playbackModeLoaded {
+                await loadPlaybackMode()
+            }
+            if nativePlayback {
+                beginNativePlay(queue: queue)
+            } else {
+                beginProxyPlay(segments: queue, ffmpegPath: ffmpegPath)
+            }
+        }
+    }
+
+    private func beginNativePlay(queue: [VideoTrimmer.Segment]) {
+        guard let first = queue.first else { return }
+        cancelPreviewPlayback()
+        restoreSourceItem()
+        isPlayingPreview = true
+        proxyPlayback = false
+        proxyOrigin = []
+        playingSelection = true
+        playQueue = Array(queue.dropFirst())
+        activePlayEnd = first.end
+        seekAndPlay(from: first.start)
+    }
+
+    private func beginProxyPlay(segments queue: [VideoTrimmer.Segment], ffmpegPath: String) {
+        cancelPreviewPlayback()
+        isPlayingPreview = false
+        proxyPlayback = false
+        scrubCaption = "正在準備預覽…"
+        let source = item.fileURL
+        proxyTask = Task { @MainActor in
+            let file = await VideoTrimmer.makePreview(url: source, segments: queue, ffmpegPath: ffmpegPath)
+            guard !Task.isCancelled else {
+                if let file { try? FileManager.default.removeItem(at: file) }
+                return
+            }
+            guard let file else {
+                scrubCaption = "無法預覽這個影片。"
+                return
+            }
+            if let previous = proxyURL {
+                try? FileManager.default.removeItem(at: previous)
+            }
+            proxyURL = file
+            proxyOrigin = queue.map { (sourceStart: $0.start, length: $0.length) }
+            player.replaceCurrentItem(with: AVPlayerItem(url: file))
+            proxyPlayback = true
+            playingSelection = true
+            acceptPlaybackTime = true
+            activePlayEnd = nil
+            playQueue = []
+            isPlayingPreview = true
+            player.play()
+        }
+    }
+
+    private func cancelPreviewPlayback() {
+        playToken += 1
+        acceptPlaybackTime = false
+        playingSelection = false
+        playQueue = []
+        activePlayEnd = nil
+        proxyTask?.cancel()
+        proxyTask = nil
+        scrubGeneration += 1
+        scrubRequested = nil
+        scrubInFlight = false
+        isPlayingPreview = false
+    }
+
+    private func restoreSourceItem() {
+        guard proxyURL != nil else { return }
+        player.replaceCurrentItem(with: AVPlayerItem(url: item.fileURL))
+    }
+
+    private func sourceTime(forProxy seconds: Double) -> Double {
+        var cursor = 0.0
+        for part in proxyOrigin {
+            if seconds <= cursor + part.length {
+                return part.sourceStart + max(0, seconds - cursor)
+            }
+            cursor += part.length
+        }
+        if let last = proxyOrigin.last {
+            return last.sourceStart + last.length
+        }
+        return seconds
+    }
+
     private func seekAndPlay(from seconds: Double) {
-        let target = CMTime(seconds: seconds, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        playToken += 1
+        let token = playToken
+        acceptPlaybackTime = false
+        let target = CMTime(seconds: max(0, seconds), preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
             Task { @MainActor in
-                self?.player.play()
+                guard let self, finished, token == self.playToken, self.playingSelection else { return }
+                self.acceptPlaybackTime = true
+                self.player.play()
             }
         }
     }

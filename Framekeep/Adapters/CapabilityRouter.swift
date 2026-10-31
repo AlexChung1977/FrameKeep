@@ -65,7 +65,7 @@ struct CapabilityRouter {
 
     private func capability(for error: AppError) -> Capability {
         switch error {
-        case .needsLogin: return .needsLogin
+        case .needsLogin, .botCheck: return .needsLogin
         case .suspectedDRM: return .suspectedDRM
         case .unsupported: return .unsupported
         case .policyBlocked: return .captureOnly

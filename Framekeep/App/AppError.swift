@@ -13,6 +13,7 @@ enum AppError: LocalizedError, Equatable {
     case cancelled
     case unsupported
     case needsLogin
+    case botCheck
     case suspectedDRM
     case policyBlocked(String)
     case store(String)
@@ -47,6 +48,8 @@ enum AppError: LocalizedError, Equatable {
             return "這個網址目前無法解析下載。可以改用擷取模式。"
         case .needsLogin:
             return "此內容需要登入。可匯入你自己的 cookies.txt，或改用擷取。"
+        case .botCheck:
+            return "YouTube 正在拒絕這台電腦的匿名下載，不是這支影片需要登入。換片或重試不會過。可在設定匯入你自己的 cookies.txt，或改用擷取。"
         case .suspectedDRM:
             return "此內容疑似受 DRM 保護。Framekeep 不會解密或規避；請改用合法播放＋擷取。"
         case .policyBlocked(let reason):
@@ -58,7 +61,7 @@ enum AppError: LocalizedError, Equatable {
 
     var suggestsCapture: Bool {
         switch self {
-        case .unsupported, .suspectedDRM, .policyBlocked, .needsLogin, .probeFailed, .downloadFailed:
+        case .unsupported, .suspectedDRM, .policyBlocked, .needsLogin, .botCheck, .probeFailed, .downloadFailed:
             return true
         default:
             return false

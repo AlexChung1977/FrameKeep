@@ -47,6 +47,7 @@ enum FailureKind: String, Codable {
     case network
     case parseFailed
     case needsLogin
+    case botCheck
     case policyBlocked
     case diskSpace
     case toolMissing
@@ -58,6 +59,7 @@ enum FailureKind: String, Codable {
         case .network: return "網路"
         case .parseFailed: return "解析失效"
         case .needsLogin: return "需登入"
+        case .botCheck: return "被拒絕"
         case .policyBlocked: return "政策阻擋"
         case .diskSpace: return "磁碟空間"
         case .toolMissing: return "工具缺失"
@@ -69,6 +71,7 @@ enum FailureKind: String, Codable {
     static func from(_ error: AppError) -> FailureKind {
         switch error {
         case .needsLogin: return .needsLogin
+        case .botCheck: return .botCheck
         case .policyBlocked: return .policyBlocked
         case .diskSpace: return .diskSpace
         case .toolMissing: return .toolMissing

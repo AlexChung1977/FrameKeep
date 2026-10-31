@@ -7,8 +7,7 @@ struct YtDlpClient {
             "--no-download",
             "--no-playlist",
             "--no-warnings",
-            "--skip-download",
-            "--no-call-home"
+            "--skip-download"
         ]
         if let cookies {
             args += ["--cookies", cookies.path]
@@ -40,6 +39,7 @@ struct YtDlpClient {
     func download(
         url: URL,
         format: String,
+        formatSort: String? = nil,
         outputTemplate: String,
         workDirectory: URL,
         cookies: URL?,
@@ -53,11 +53,13 @@ struct YtDlpClient {
             "--newline",
             "--progress",
             "--no-warnings",
-            "--no-call-home",
             "--restrict-filenames",
             "-f", format,
             "-o", outputTemplate
         ]
+        if let formatSort, !formatSort.isEmpty {
+            args += ["-S", formatSort]
+        }
         if FormatSelector.prefersAudioOnly(format) {
             args += ["--extract-audio", "--audio-format", "m4a"]
         } else {
@@ -115,8 +117,8 @@ struct YtDlpClient {
         guard let object = firstJSONObject(in: stdout) else {
             throw AppError.probeFailed("yt-dlp 沒有回傳可用的 JSON。")
         }
-        let title = (object["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
         let extractor = (object["extractor"] as? String) ?? (object["extractor_key"] as? String) ?? "generic"
+        let title = Self.mediaTitle(from: object, extractor: extractor, fallbackURL: fallbackURL)
         let host = fallbackURL.host ?? (object["webpage_url_domain"] as? String) ?? extractor
         let duration = (object["duration"] as? Double) ?? (object["duration"] as? Int).map(Double.init)
         let thumb = (object["thumbnail"] as? String).flatMap(URL.init(string:))
@@ -140,7 +142,7 @@ struct YtDlpClient {
 
         return ProbeResult(
             url: (object["webpage_url"] as? String).flatMap(URL.init(string:)) ?? fallbackURL,
-            title: (title?.isEmpty == false ? title! : fallbackURL.lastPathComponent),
+            title: title,
             thumbnailURL: thumb,
             duration: duration,
             sourceHost: host,
@@ -153,14 +155,77 @@ struct YtDlpClient {
         )
     }
 
+    private static func mediaTitle(from object: [String: Any], extractor: String, fallbackURL: URL) -> String {
+        let raw = trimmedText(object["title"])
+        let domain = (object["webpage_url_domain"] as? String) ?? ""
+        let host = (fallbackURL.host ?? domain).lowercased()
+        let isInstagram = extractor.lowercased().contains("instagram") || host.contains("instagram")
+        if isInstagram {
+            if let raw, !isGenericInstagramTitle(raw, id: trimmedText(object["id"])) {
+                return raw
+            }
+            if let description = trimmedText(object["description"]),
+               let caption = instagramCaptionName(description) {
+                return caption
+            }
+        }
+        if let raw { return raw }
+        return fallbackURL.lastPathComponent
+    }
+
+    private static func isGenericInstagramTitle(_ title: String, id: String?) -> Bool {
+        if let id, title.caseInsensitiveCompare(id) == .orderedSame { return true }
+        let lower = title.lowercased()
+        if lower.range(of: #"^(video|post|story) by \S+$"#, options: .regularExpression) != nil { return true }
+        if lower.range(of: #"^video \d+$"#, options: .regularExpression) != nil { return true }
+        return false
+    }
+
+    /// Instagram keeps the post name in the caption. Use the first real line, without a trailing tag list.
+    private static func instagramCaptionName(_ description: String) -> String? {
+        let lines = description
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard let line = lines.first(where: { !isHashtagLine($0) }) ?? lines.first else { return nil }
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        var end = tokens.count
+        while end > 0 {
+            let token = tokens[end - 1]
+            if token.hasPrefix("#") || token.hasPrefix("@") {
+                end -= 1
+            } else {
+                break
+            }
+        }
+        let name = tokens.prefix(end).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.isEmpty ? line : name
+    }
+
+    private static func isHashtagLine(_ line: String) -> Bool {
+        let tokens = line.split(whereSeparator: \.isWhitespace).map(String.init)
+        guard !tokens.isEmpty else { return true }
+        return tokens.allSatisfy { $0.hasPrefix("#") || $0.hasPrefix("@") }
+    }
+
+    private static func trimmedText(_ value: Any?) -> String? {
+        guard let text = value as? String else { return nil }
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? nil : cleaned
+    }
+
     func mapFailure(stdout: String, stderr: String) -> AppError {
         let blob = (stdout + "\n" + stderr).lowercased()
         if blob.contains("drm") || blob.contains("widevine") || blob.contains("protected with") {
             return .suspectedDRM
         }
+        if blob.contains("confirm you’re not a bot") || blob.contains("confirm you're not a bot") {
+            return .botCheck
+        }
         if blob.contains("sign in") || blob.contains("login") || blob.contains("private video")
-            || blob.contains("confirm you’re not a bot") || blob.contains("confirm you're not a bot")
-            || blob.contains("cookies") && blob.contains("age") {
+            || blob.contains("cookies") && blob.contains("age")
+            || blob.contains("available to everyone") || blob.contains("certain audiences")
+            || blob.contains("restricted video") {
             return .needsLogin
         }
         if blob.contains("unsupported url") || blob.contains("no suitable") && blob.contains("extractor") {
@@ -192,10 +257,22 @@ struct YtDlpClient {
         let lines = (stderr + "\n" + stdout)
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty && !$0.hasPrefix("[debug]") }
-        return lines.suffix(3).joined(separator: " ").isEmpty
-            ? "未知錯誤"
-            : lines.suffix(3).joined(separator: " ")
+            .filter { line in
+                guard !line.isEmpty, !line.hasPrefix("[debug]") else { return false }
+                let lower = line.lowercased()
+                if lower.hasPrefix("deprecated feature") { return false }
+                if lower.hasPrefix("please remove them from your command") { return false }
+                if lower.contains("yt-dlp/issues/14198") { return false }
+                return true
+            }
+        let errors = lines.filter { $0.hasPrefix("ERROR:") }
+        let chosen = errors.last ?? lines.last
+        guard let chosen else { return "未知錯誤" }
+        if let range = chosen.range(of: #"^ERROR:\s*(\[[^\]]+\]\s*)?[^:]+:\s*"#, options: .regularExpression) {
+            let detail = String(chosen[range.upperBound...]).trimmingCharacters(in: .whitespaces)
+            if !detail.isEmpty { return detail }
+        }
+        return chosen
     }
 
     private func parseFormats(_ raw: [[String: Any]]) -> [MediaFormat] {

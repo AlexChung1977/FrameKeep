@@ -19,6 +19,7 @@ final class AppState: ObservableObject {
     @Published var renameTarget: MediaItem?
     @Published var renameText: String = ""
     @Published var trimTarget: MediaItem?
+    @Published var trimRequest = 0
 
     let settings: AppSettings
     let toolchain: ToolchainDetector
@@ -33,6 +34,12 @@ final class AppState: ObservableObject {
     private var deferredPage: String?
     private var lastExternalKey = ""
     private var lastExternalAt = Date.distantPast
+    private var closeMainAfterTrim = false
+    private var lastTrimPath = ""
+    private var lastTrimAt = Date.distantPast
+    private var ingestingText: String?
+    private var followupText: String?
+    private var ignoreNextURLChange = false
 
     init() {
         let settings = AppSettings()
@@ -55,6 +62,11 @@ final class AppState: ObservableObject {
         BrowserLinkCenter.shared.bind { [weak self] url in
             Task { @MainActor in
                 self?.acceptExternalURL(url)
+            }
+        }
+        TrimFileCenter.shared.bind { [weak self] request in
+            Task { @MainActor in
+                self?.openTrim(files: request.urls, replacesMainWindow: request.replacesMainWindow)
             }
         }
 
@@ -109,7 +121,35 @@ final class AppState: ObservableObject {
         }
     }
 
+    func consumeURLAutostartSuppression() -> Bool {
+        let suppressed = ignoreNextURLChange
+        ignoreNextURLChange = false
+        return suppressed
+    }
+
     func continueIngest(source: IngestSource = .manual) async {
+        let text = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if ingestingText != nil {
+            if !text.isEmpty, text != ingestingText {
+                followupText = text
+            }
+            return
+        }
+        ingestingText = text
+        await performIngest(source: source)
+        let done = ingestingText
+        ingestingText = nil
+        if let next = followupText, next != done {
+            followupText = nil
+            ignoreNextURLChange = true
+            urlText = next
+            await continueIngest(source: source)
+        } else {
+            followupText = nil
+        }
+    }
+
+    private func performIngest(source: IngestSource) async {
         banner = nil
         guard toolchain.status.isReady, let ytdlp = toolchain.status.ytdlpURL else {
             showingSetup = true
@@ -117,15 +157,16 @@ final class AppState: ObservableObject {
         }
         do {
             var request = try URLIngestService.makeRequest(from: urlText, source: source)
+            isProbing = true
             let expanded = await URLIngestService.expandIfShort(request.url)
             if expanded != request.url {
                 request = IngestRequest(id: request.id, url: expanded, source: source, originalText: request.originalText)
+                ignoreNextURLChange = true
                 urlText = expanded.absoluteString
             }
             let job = DownloadJob.probing(request: request)
             queue.insertProbing(job)
             activeJobID = job.id
-            isProbing = true
             let decision = await router.route(
                 request: request,
                 cookies: settings.cookieFileURL,
@@ -136,16 +177,16 @@ final class AppState: ObservableObject {
             if let probe = decision.probe, decision.capability == .downloadable {
                 queue.updateAfterProbe(job.id, probe: probe)
                 activeProbe = probe
-                pickerPreset = settings.defaultFormat
-                pickerCustom = probe.recommendedFormat(for: settings.defaultFormat)
-                showingPicker = true
+                let preset = settings.defaultFormat == .custom ? DefaultFormatPreset.best : settings.defaultFormat
+                pickerPreset = preset
+                pickerCustom = probe.recommendedFormat(for: preset)
+                enqueueCurrentPick()
+                ignoreNextURLChange = true
+                urlText = ""
             } else {
                 let error = decision.error ?? .unsupported
                 queue.markFailed(job.id, error: error)
                 banner = decision.statusChinese
-                if decision.suggestsCapture {
-                    // Stay on Home with an honest status; user can jump to Capture.
-                }
             }
         } catch let error as AppError {
             isProbing = false
@@ -171,8 +212,8 @@ final class AppState: ObservableObject {
             library: library
         )
         showingPicker = false
-        selected = .queue
-        banner = "已加入佇列。"
+        selected = .home
+        banner = nil
     }
 
     func switchToCaptureFromPicker() {
@@ -184,6 +225,7 @@ final class AppState: ObservableObject {
     }
 
     func switchToCapture(from job: DownloadJob) {
+        ignoreNextURLChange = true
         urlText = job.url.absoluteString
         selected = .capture
         banner = "改用擷取：請在瀏覽器播放內容後按錄製。"
@@ -211,6 +253,95 @@ final class AppState: ObservableObject {
 
     func cancel(_ job: DownloadJob) {
         queue.cancel(job)
+    }
+
+    func removeFromQueue(_ job: DownloadJob) {
+        removeFromQueue([job.id])
+    }
+
+    func removeFromQueue(_ ids: Set<UUID>) {
+        let targets = queue.jobs.filter { ids.contains($0.id) }
+        for job in targets {
+            queue.remove(job)
+            if activeJobID == job.id {
+                showingPicker = false
+                activeJobID = nil
+            }
+        }
+    }
+
+    func openTrim(files: [URL], replacesMainWindow: Bool = false) {
+        let videos = files.filter(VideoFiles.isVideo)
+        guard let first = videos.first else {
+            banner = "請選擇影片檔。"
+            return
+        }
+        if replacesMainWindow {
+            closeMainAfterTrim = true
+        }
+        let now = Date()
+        let sameFile = first.path == lastTrimPath && now.timeIntervalSince(lastTrimAt) < 1.5
+        lastTrimPath = first.path
+        lastTrimAt = now
+        if !sameFile {
+            trimTarget = MediaItem.importedFile(first)
+        }
+        trimRequest += 1
+        NSApp.activate(ignoringOtherApps: true)
+        if videos.count > 1 {
+            banner = "已開啟第一個影片。一次剪接一個檔案。"
+        }
+    }
+
+    func takeCloseMainAfterTrim() -> Bool {
+        let value = closeMainAfterTrim
+        closeMainAfterTrim = false
+        return value
+    }
+
+    func chooseTrimVideo() {
+        let panel = NSOpenPanel()
+        panel.title = "選擇要剪接的影片"
+        panel.prompt = "選擇"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.movie, .video, .mpeg4Movie, .quickTimeMovie]
+        let finish: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK, let url = panel.url else { return }
+            DispatchQueue.main.async {
+                self.openTrim(files: [url])
+            }
+        }
+        if let window = NSApp.keyWindow {
+            panel.beginSheetModal(for: window, completionHandler: finish)
+        } else {
+            panel.begin(completionHandler: finish)
+        }
+    }
+
+    func acceptTrimProviders(_ providers: [NSItemProvider]) -> Bool {
+        let fileProviders = providers.filter {
+            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+        }
+        guard !fileProviders.isEmpty else { return false }
+        for provider in fileProviders {
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { item, _ in
+                let url: URL?
+                if let fileURL = item as? URL {
+                    url = fileURL
+                } else if let data = item as? Data {
+                    url = URL(dataRepresentation: data, relativeTo: nil)
+                } else {
+                    url = nil
+                }
+                guard let url else { return }
+                DispatchQueue.main.async {
+                    self.openTrim(files: [url])
+                }
+            }
+        }
+        return true
     }
 
     func startCapture() async {
@@ -288,6 +419,7 @@ final class AppState: ObservableObject {
             DispatchQueue.main.async {
                 guard self.urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                       let text = URLIngestService.pasteboardURLString() else { return }
+                self.ignoreNextURLChange = true
                 self.urlText = text
             }
         }

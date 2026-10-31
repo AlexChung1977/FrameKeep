@@ -29,6 +29,10 @@ final class LibraryService: ObservableObject {
         do {
             let rows = try db.query("SELECT * FROM media ORDER BY created_at DESC")
             items = rows.compactMap(Self.item(from:))
+            for item in items {
+                guard let source = item.sourceURL, item.exists else { continue }
+                FileWhereFrom.stamp(file: item.fileURL, source: source)
+            }
         } catch {
             AppLog.error("library reload: \(error.localizedDescription)")
             items = []
@@ -57,6 +61,7 @@ final class LibraryService: ObservableObject {
         }
         try AppPaths.ensureDirectory(dest.deletingLastPathComponent())
         let finalURL = try atomicMove(file, to: dest)
+        FileWhereFrom.stamp(file: finalURL, source: job.url)
         let item = MediaItem(
             id: job.id,
             title: job.title,
@@ -102,6 +107,9 @@ final class LibraryService: ObservableObject {
         }
         try AppPaths.ensureDirectory(dest.deletingLastPathComponent())
         let finalURL = try atomicMove(file, to: dest)
+        if let page = source.sourceURL {
+            FileWhereFrom.stamp(file: finalURL, source: page)
+        }
         let item = MediaItem(
             id: id,
             title: trimmedTitle.isEmpty ? "\(source.title) 剪接" : trimmedTitle,
@@ -129,6 +137,9 @@ final class LibraryService: ObservableObject {
         let dest = AppPaths.capturesDirectory(root: settings.moviesRootURL)
             .appendingPathComponent("\(id.uuidString.prefix(8))_capture.\(file.pathExtension.isEmpty ? "mov" : file.pathExtension)")
         let finalURL = try atomicMove(file, to: dest)
+        if let sourceURL {
+            FileWhereFrom.stamp(file: finalURL, source: sourceURL)
+        }
         let item = MediaItem(
             id: id,
             title: title,
@@ -146,11 +157,23 @@ final class LibraryService: ObservableObject {
     }
 
     func reveal(_ item: MediaItem) {
-        NSWorkspace.shared.activateFileViewerSelecting([item.fileURL])
+        reveal([item])
+    }
+
+    func reveal(_ items: [MediaItem]) {
+        let urls = items.map(\.fileURL)
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
     func open(_ item: MediaItem) {
-        NSWorkspace.shared.open(item.fileURL)
+        open([item])
+    }
+
+    func open(_ items: [MediaItem]) {
+        for item in items {
+            NSWorkspace.shared.open(item.fileURL)
+        }
     }
 
     func rename(_ item: MediaItem, to title: String) throws {
@@ -164,13 +187,20 @@ final class LibraryService: ObservableObject {
     }
 
     func delete(_ item: MediaItem, deleteFile: Bool) throws {
-        if deleteFile, FileManager.default.fileExists(atPath: item.filePath) {
-            try FileManager.default.removeItem(at: item.fileURL)
+        try delete([item], deleteFile: deleteFile)
+    }
+
+    func delete(_ items: [MediaItem], deleteFile: Bool) throws {
+        guard !items.isEmpty else { return }
+        for item in items {
+            if deleteFile, FileManager.default.fileExists(atPath: item.filePath) {
+                try FileManager.default.removeItem(at: item.fileURL)
+            }
+            try db.run("DELETE FROM media WHERE id = ?") { [db] stmt in
+                db.bindText(stmt, 1, item.id.uuidString)
+            }
+            VideoThumbnail.removeCache(for: item.id)
         }
-        try db.run("DELETE FROM media WHERE id = ?") { [db] stmt in
-            db.bindText(stmt, 1, item.id.uuidString)
-        }
-        VideoThumbnail.removeCache(for: item.id)
         reload()
     }
 
@@ -239,6 +269,42 @@ final class LibraryService: ObservableObject {
             host: row["host"]?.string,
             createdAt: Date(timeIntervalSince1970: row["created_at"]?.double ?? 0)
         )
+    }
+}
+
+enum FileWhereFrom {
+    private static let attribute = "com.apple.metadata:kMDItemWhereFroms"
+
+    static func stamp(file: URL, source: URL) {
+        let page = source.absoluteString
+        guard !page.isEmpty, FileManager.default.fileExists(atPath: file.path) else { return }
+        if current(file) == [page] { return }
+        guard let data = try? PropertyListSerialization.data(
+            fromPropertyList: [page],
+            format: .binary,
+            options: 0
+        ) else { return }
+        let wrote = data.withUnsafeBytes { buffer -> Int32 in
+            guard let base = buffer.baseAddress else { return -1 }
+            return setxattr(file.path, attribute, base, buffer.count, 0, 0)
+        }
+        if wrote != 0 {
+            AppLog.info("where-from skipped for \(file.lastPathComponent): \(String(cString: strerror(errno)))")
+        }
+    }
+
+    private static func current(_ file: URL) -> [String]? {
+        let size = getxattr(file.path, attribute, nil, 0, 0, 0)
+        guard size > 0 else { return nil }
+        var data = Data(count: size)
+        let read = data.withUnsafeMutableBytes { buffer -> ssize_t in
+            guard let base = buffer.baseAddress else { return -1 }
+            return getxattr(file.path, attribute, base, size, 0, 0)
+        }
+        guard read == size,
+              let pages = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String]
+        else { return nil }
+        return pages
     }
 }
 

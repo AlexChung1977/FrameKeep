@@ -2,7 +2,6 @@ import SwiftUI
 
 enum SidebarDestination: String, CaseIterable, Identifiable, Hashable {
     case home
-    case queue
     case library
     case capture
     case settings
@@ -11,8 +10,7 @@ enum SidebarDestination: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .home: return "首頁"
-        case .queue: return "佇列"
+        case .home: return "下載"
         case .library: return "媒體庫"
         case .capture: return "擷取"
         case .settings: return "設定"
@@ -21,8 +19,7 @@ enum SidebarDestination: String, CaseIterable, Identifiable, Hashable {
 
     var symbol: String {
         switch self {
-        case .home: return "house"
-        case .queue: return "list.bullet.rectangle"
+        case .home: return "arrow.down.circle"
         case .library: return "square.grid.2x2"
         case .capture: return "record.circle"
         case .settings: return "gearshape"
