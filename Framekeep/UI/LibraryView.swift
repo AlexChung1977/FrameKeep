@@ -7,6 +7,7 @@ struct LibraryView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var selection = Set<MediaItem.ID>()
     @State private var selectionAnchor: MediaItem.ID?
+    @State private var moveTargets: [MediaItem] = []
 
     private let columns = [
         GridItem(.adaptive(minimum: 168, maximum: 220), spacing: 14)
@@ -19,7 +20,7 @@ struct LibraryView: View {
                 Spacer()
                 EmptyStateView(
                     title: emptyTitle,
-                    detail: "完成下載或擷取後，檔案會出現在這裡。"
+                    detail: emptyDetail
                 )
                 Spacer()
             } else {
@@ -38,6 +39,8 @@ struct LibraryView: View {
                                 openWindow(id: "trim")
                             } onRemove: { items, deleteFile in
                                 remove(Set(items.map(\.id)), deleteFile: deleteFile)
+                            } onMove: { items in
+                                moveTargets = items
                             } targets: {
                                 targets(including: item.id)
                             }
@@ -56,12 +59,21 @@ struct LibraryView: View {
             }
         }
         .background(FKColor.graphite)
-        .onChange(of: library.filter) { _ in
-            let visible = Set(library.visibleItems.map(\.id))
-            selection.formIntersection(visible)
+        .onChange(of: library.items.map(\.id)) { ids in
+            selection.formIntersection(Set(ids))
             if let selectionAnchor, !selection.contains(selectionAnchor) {
                 self.selectionAnchor = selection.first
             }
+        }
+        .onChange(of: library.filter) { _ in
+            keepFormatFilterValid()
+            trimSelectionToVisible()
+        }
+        .onChange(of: library.formatFilter) { _ in
+            trimSelectionToVisible()
+        }
+        .onChange(of: library.availableFormats) { _ in
+            keepFormatFilterValid()
         }
         .background {
             VStack {
@@ -81,6 +93,16 @@ struct LibraryView: View {
                 .environmentObject(app)
                 .environmentObject(library)
         }
+        .sheet(isPresented: Binding(
+            get: { !moveTargets.isEmpty },
+            set: { if !$0 { moveTargets = [] } }
+        )) {
+            MoveLibrarySheet(items: moveTargets) {
+                moveTargets = []
+            }
+            .environmentObject(app)
+            .environmentObject(library)
+        }
     }
 
     private var header: some View {
@@ -90,10 +112,20 @@ struct LibraryView: View {
                 .foregroundStyle(FKColor.paper)
             Spacer()
             if !selection.isEmpty {
+                GhostButton(title: "移動所選 \(selection.count) 項") {
+                    beginMove(selection)
+                }
                 GhostButton(title: "移除所選 \(selection.count) 項") {
                     remove(selection, deleteFile: false)
                 }
             }
+            Picker("格式", selection: $library.formatFilter) {
+                Text("全部格式").tag("")
+                ForEach(library.availableFormats, id: \.self) { format in
+                    Text(format).tag(format)
+                }
+            }
+            .frame(width: 120)
             Picker("", selection: $library.filter) {
                 ForEach(LibraryFilter.allCases) { filter in
                     Text(filter.title).tag(filter)
@@ -134,6 +166,21 @@ struct LibraryView: View {
         selectionAnchor = id
     }
 
+    private func trimSelectionToVisible() {
+        let visible = Set(library.visibleItems.map(\.id))
+        selection.formIntersection(visible)
+        if let selectionAnchor, !selection.contains(selectionAnchor) {
+            self.selectionAnchor = selection.first
+        }
+    }
+
+    private func keepFormatFilterValid() {
+        guard !library.formatFilter.isEmpty else { return }
+        if !library.availableFormats.contains(library.formatFilter) {
+            library.formatFilter = ""
+        }
+    }
+
     private func selectAll() {
         selection = Set(library.visibleItems.map(\.id))
         selectionAnchor = library.visibleItems.first?.id
@@ -142,6 +189,12 @@ struct LibraryView: View {
     private func targets(including id: MediaItem.ID) -> [MediaItem] {
         let ids = selection.contains(id) ? selection : [id]
         return library.visibleItems.filter { ids.contains($0.id) }
+    }
+
+    private func beginMove(_ ids: Set<MediaItem.ID>) {
+        let targets = library.visibleItems.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        moveTargets = targets
     }
 
     private func remove(_ ids: Set<MediaItem.ID>, deleteFile: Bool) {
@@ -155,11 +208,20 @@ struct LibraryView: View {
     }
 
     private var emptyTitle: String {
+        if !library.itemsMatchingKind.isEmpty {
+            return "沒有 \(library.formatFilter) 檔案"
+        }
         switch library.filter {
         case .all: return "還沒有媒體"
         case .downloads: return "還沒有下載項目"
         case .captures: return "還沒有擷取項目"
         }
+    }
+
+    private var emptyDetail: String {
+        library.itemsMatchingKind.isEmpty
+            ? "完成下載或擷取後，檔案會出現在這裡。"
+            : "改選其他格式，或選回全部格式。"
     }
 }
 
@@ -172,6 +234,7 @@ private struct LibraryCard: View {
     var onOpen: () -> Void
     var onTrim: () -> Void
     var onRemove: ([MediaItem], Bool) -> Void
+    var onMove: ([MediaItem]) -> Void
     var targets: () -> [MediaItem]
     @State private var thumbnail: NSImage?
 
@@ -207,6 +270,9 @@ private struct LibraryCard: View {
                     }
                 }
                 .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            Text(item.fileFormat)
+                .font(FKFont.body(10, weight: .medium))
+                .foregroundStyle(FKColor.amber)
             Text(item.title)
                 .font(FKFont.body(12, weight: .medium))
                 .foregroundStyle(FKColor.paper)
@@ -245,6 +311,9 @@ private struct LibraryCard: View {
                 }
                 Button("剪接…") { onTrim() }
             }
+            Button(count > 1 ? "移動所選 \(count) 項…" : "移動到…") {
+                onMove(chosen)
+            }
             Divider()
             Button(count > 1 ? "從媒體庫移除所選 \(count) 項" : "從媒體庫移除", role: .destructive) {
                 onRemove(chosen, false)
@@ -279,5 +348,133 @@ private struct RenameSheet: View {
         }
         .padding(20)
         .frame(width: 360)
+    }
+}
+
+private struct MoveLibrarySheet: View {
+    @EnvironmentObject private var app: AppState
+    @EnvironmentObject private var library: LibraryService
+    @EnvironmentObject private var settings: AppSettings
+    let items: [MediaItem]
+    var onClose: () -> Void
+    @State private var notice: String?
+    @State private var progress: LibraryMoveProgress?
+    @State private var moving = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(moving ? "正在移動" : "移動 \(items.count) 個檔案")
+                .font(FKFont.display(16, weight: .semibold))
+            Text("最多 \(AppSettings.folderFavoriteLimit) 組最愛。也可以這次另外選一個資料夾。")
+                .font(FKFont.body(12))
+                .foregroundStyle(FKColor.paperMuted)
+            if settings.folderFavorites.isEmpty {
+                Text("還沒有最愛目錄。")
+                    .font(FKFont.body(12))
+                    .foregroundStyle(FKColor.paperFaint)
+            } else {
+                ScrollView {
+                    VStack(spacing: 8) {
+                        ForEach(settings.folderFavorites) { favorite in
+                            HStack(spacing: 10) {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(favorite.name)
+                                        .font(FKFont.body(13, weight: .medium))
+                                        .foregroundStyle(FKColor.paper)
+                                        .lineLimit(1)
+                                    Text(favorite.path)
+                                        .font(FKFont.body(10))
+                                        .foregroundStyle(FKColor.paperFaint)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
+                                }
+                                Spacer(minLength: 8)
+                                GhostButton(title: "移除") {
+                                    settings.removeFolderFavorite(favorite.id)
+                                }
+                                AmberButton(title: "移動", enabled: !moving, prominent: false) {
+                                    move(to: favorite.url)
+                                }
+                            }
+                            .padding(10)
+                            .fkCard(corner: 8)
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+            }
+            if let progress {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("\(progress.index) / \(progress.total)　\(progress.title)")
+                        .font(FKFont.body(12))
+                        .foregroundStyle(FKColor.paper)
+                        .lineLimit(1)
+                    ProgressView(value: progress.fraction)
+                        .tint(FKColor.amber)
+                    Text("\(Int((progress.fraction * 100).rounded()))%")
+                        .font(FKFont.body(11))
+                        .foregroundStyle(FKColor.paperMuted)
+                        .monospacedDigit()
+                }
+            }
+            if let notice {
+                Text(notice)
+                    .font(FKFont.body(12))
+                    .foregroundStyle(FKColor.danger)
+            }
+            HStack {
+                AmberButton(title: "加入最愛…", enabled: !moving && settings.folderFavorites.count < AppSettings.folderFavoriteLimit, prominent: false) {
+                    addFavorite()
+                }
+                AmberButton(title: "選擇其他資料夾…", enabled: !moving, prominent: false) {
+                    chooseAndMove()
+                }
+                Spacer()
+                Button("完成") { onClose() }
+                    .disabled(moving)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+        .background(FKColor.graphite)
+        .foregroundStyle(FKColor.paper)
+        .interactiveDismissDisabled(moving)
+    }
+
+    private func addFavorite() {
+        guard let url = pickDirectory(prompt: "加入最愛", message: "選擇要記住的資料夾。") else { return }
+        notice = settings.addFolderFavorite(url)
+    }
+
+    private func chooseAndMove() {
+        guard let url = pickDirectory(prompt: "移動", message: "選擇這次要移入的資料夾。") else { return }
+        move(to: url)
+    }
+
+    private func move(to directory: URL) {
+        guard !moving else { return }
+        moving = true
+        progress = LibraryMoveProgress(index: 1, total: items.count, title: items.first?.title ?? "", fraction: 0)
+        Task {
+            let message = await library.move(items, to: directory) { update in
+                progress = update
+            }
+            app.banner = message
+            moving = false
+            onClose()
+        }
+    }
+
+    private func pickDirectory(prompt: String, message: String) -> URL? {
+        let panel = NSOpenPanel()
+        panel.title = prompt
+        panel.message = message
+        panel.prompt = prompt
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK else { return nil }
+        return panel.url
     }
 }

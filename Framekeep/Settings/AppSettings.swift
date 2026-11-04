@@ -54,6 +54,7 @@ final class AppSettings: ObservableObject {
     @Published var ffmpegPath: String
     @Published var includeMicrophoneByDefault: Bool
     @Published var trimOutputDirectory: String
+    @Published var folderFavorites: [FolderFavorite]
 
     private let defaults: UserDefaults
     private var cancellables = Set<AnyCancellable>()
@@ -77,6 +78,7 @@ final class AppSettings: ObservableObject {
         ffmpegPath = defaults.string(forKey: Key.ffmpegPath) ?? ""
         includeMicrophoneByDefault = defaults.bool(forKey: Key.includeMic)
         trimOutputDirectory = defaults.string(forKey: Key.trimOutput) ?? ""
+        folderFavorites = Self.loadFolderFavorites(defaults)
 
         $moviesRootPath.sink { [weak self] in self?.defaults.set($0, forKey: Key.moviesRoot) }.store(in: &cancellables)
         $defaultFormat.sink { [weak self] in self?.defaults.set($0.rawValue, forKey: Key.defaultFormat) }.store(in: &cancellables)
@@ -88,6 +90,10 @@ final class AppSettings: ObservableObject {
         $ffmpegPath.sink { [weak self] in self?.defaults.set($0, forKey: Key.ffmpegPath) }.store(in: &cancellables)
         $includeMicrophoneByDefault.sink { [weak self] in self?.defaults.set($0, forKey: Key.includeMic) }.store(in: &cancellables)
         $trimOutputDirectory.sink { [weak self] in self?.defaults.set($0, forKey: Key.trimOutput) }.store(in: &cancellables)
+        $folderFavorites.sink { [weak self] favorites in
+            guard let data = try? JSONEncoder().encode(Array(favorites.prefix(10))) else { return }
+            self?.defaults.set(data, forKey: Key.folderFavorites)
+        }.store(in: &cancellables)
         $cookieFilePath.sink { path in
             KeychainStore.save(account: Key.cookieFile, value: path)
             defaults.set(path.isEmpty ? nil : "<set>", forKey: Key.cookieFilePresent)
@@ -113,6 +119,39 @@ final class AppSettings: ObservableObject {
         KeychainStore.delete(account: Key.cookieFile)
     }
 
+    static let folderFavoriteLimit = 10
+
+    func addFolderFavorite(_ url: URL) -> String? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return "請選擇一個資料夾。"
+        }
+        let path = url.standardizedFileURL.path
+        if folderFavorites.contains(where: { URL(fileURLWithPath: $0.path).standardizedFileURL.path == path }) {
+            return "這個資料夾已在最愛裡。"
+        }
+        guard folderFavorites.count < Self.folderFavoriteLimit else {
+            return "最愛目錄最多 \(Self.folderFavoriteLimit) 組。"
+        }
+        folderFavorites.append(FolderFavorite(id: UUID(), path: path))
+        return nil
+    }
+
+    func removeFolderFavorite(_ id: UUID) {
+        folderFavorites.removeAll { $0.id == id }
+    }
+
+    private static func loadFolderFavorites(_ defaults: UserDefaults) -> [FolderFavorite] {
+        guard let data = defaults.data(forKey: Key.folderFavorites),
+              let decoded = try? JSONDecoder().decode([FolderFavorite].self, from: data)
+        else { return [] }
+        var seen = Set<String>()
+        return decoded.filter { favorite in
+            let path = URL(fileURLWithPath: favorite.path).standardizedFileURL.path
+            return seen.insert(path).inserted
+        }.prefix(folderFavoriteLimit).map { $0 }
+    }
+
     private enum Key {
         static let moviesRoot = "settings.moviesRoot"
         static let defaultFormat = "settings.defaultFormat"
@@ -126,6 +165,19 @@ final class AppSettings: ObservableObject {
         static let ffmpegPath = "settings.ffmpegPath"
         static let includeMic = "settings.includeMic"
         static let trimOutput = "settings.trimOutputDirectory"
+        static let folderFavorites = "settings.folderFavorites"
+    }
+}
+
+struct FolderFavorite: Codable, Identifiable, Equatable {
+    var id: UUID
+    var path: String
+
+    var url: URL { URL(fileURLWithPath: path, isDirectory: true) }
+
+    var name: String {
+        let folder = url.lastPathComponent
+        return folder.isEmpty ? path : folder
     }
 }
 

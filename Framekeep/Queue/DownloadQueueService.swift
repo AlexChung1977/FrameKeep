@@ -251,10 +251,13 @@ final class DownloadQueueService: ObservableObject {
             upsert(finished)
             try? FileManager.default.removeItem(at: work)
         } catch is CancellationError {
+            try? FileManager.default.removeItem(at: work)
             markFailed(job.id, error: .cancelled)
         } catch let error as AppError {
+            try? FileManager.default.removeItem(at: work)
             markFailed(job.id, error: error)
         } catch {
+            try? FileManager.default.removeItem(at: work)
             markFailed(job.id, error: .downloadFailed(error.localizedDescription))
         }
         handles[job.id] = nil

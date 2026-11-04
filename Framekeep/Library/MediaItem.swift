@@ -30,6 +30,11 @@ struct MediaItem: Identifiable, Hashable {
 
     var fileURL: URL { URL(fileURLWithPath: filePath) }
 
+    var fileFormat: String {
+        let ext = fileURL.pathExtension.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ext.isEmpty ? "未知" : ext.uppercased()
+    }
+
     var exists: Bool {
         FileManager.default.fileExists(atPath: filePath)
     }

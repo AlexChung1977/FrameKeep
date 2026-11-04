@@ -1,12 +1,14 @@
 import AppKit
 import AVFoundation
 import Combine
+import Darwin
 import Foundation
 
 @MainActor
 final class LibraryService: ObservableObject {
     @Published private(set) var items: [MediaItem] = []
     @Published var filter: LibraryFilter = .all
+    @Published var formatFilter = ""
 
     private let db: SQLiteStore
     private let settings: AppSettings
@@ -17,12 +19,21 @@ final class LibraryService: ObservableObject {
         reload()
     }
 
-    var visibleItems: [MediaItem] {
+    var itemsMatchingKind: [MediaItem] {
         switch filter {
         case .all: return items
         case .downloads: return items.filter { $0.kind == .download }
         case .captures: return items.filter { $0.kind == .capture }
         }
+    }
+
+    var availableFormats: [String] {
+        Array(Set(itemsMatchingKind.map(\.fileFormat))).sorted()
+    }
+
+    var visibleItems: [MediaItem] {
+        guard !formatFilter.isEmpty else { return itemsMatchingKind }
+        return itemsMatchingKind.filter { $0.fileFormat == formatFilter }
     }
 
     func reload() {
@@ -176,6 +187,96 @@ final class LibraryService: ObservableObject {
         }
     }
 
+    func move(
+        _ items: [MediaItem],
+        to directory: URL,
+        onProgress: @escaping @MainActor (LibraryMoveProgress) -> Void
+    ) async -> String {
+        let folder = directory.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            return "找不到目的資料夾。"
+        }
+        let total = items.count
+        var moved = 0
+        var failures: [String] = []
+        for (offset, item) in items.enumerated() {
+            let index = offset + 1
+            let source = item.fileURL.standardizedFileURL
+            func report(_ fileFraction: Double) {
+                let overall = total == 0 ? 1 : (Double(offset) + min(1, max(0, fileFraction))) / Double(total)
+                onProgress(LibraryMoveProgress(index: index, total: total, title: item.title, fraction: overall))
+            }
+            report(0)
+            if source.deletingLastPathComponent().path == folder.path {
+                do {
+                    try removeFromLibrary(item.id)
+                    moved += 1
+                } catch {
+                    failures.append("\(item.title)：\(error.localizedDescription)")
+                }
+                report(1)
+                continue
+            }
+            guard FileManager.default.fileExists(atPath: source.path) else {
+                failures.append("\(item.title)：找不到檔案")
+                report(1)
+                continue
+            }
+            let dest = uniqueFileURL(in: folder, fileName: source.lastPathComponent)
+            let itemID = item.id
+            do {
+                try await Task.detached(priority: .userInitiated) {
+                    try FileMover.transfer(from: source, to: dest) { fraction in
+                        Task { @MainActor in report(fraction) }
+                    }
+                }.value
+                try removeFromLibrary(itemID)
+                moved += 1
+                report(1)
+            } catch {
+                if FileManager.default.fileExists(atPath: dest.path), !FileManager.default.fileExists(atPath: source.path) {
+                    try? await Task.detached(priority: .userInitiated) {
+                        try FileMover.transfer(from: dest, to: source) { _ in }
+                    }.value
+                } else if FileManager.default.fileExists(atPath: dest.path), FileManager.default.fileExists(atPath: source.path) {
+                    try? FileManager.default.removeItem(at: dest)
+                }
+                failures.append("\(item.title)：\(error.localizedDescription)")
+                report(1)
+            }
+        }
+        reload()
+        let place = folder.lastPathComponent.isEmpty ? folder.path : folder.lastPathComponent
+        if failures.isEmpty {
+            return "已將 \(moved) 個檔案移到「\(place)」，並從媒體庫移除。"
+        }
+        if moved == 0 {
+            return "沒有移動檔案。\(failures.prefix(2).joined(separator: " "))"
+        }
+        return "已移動 \(moved) 個到「\(place)」，並從媒體庫移除。\(failures.count) 個失敗：\(failures.prefix(2).joined(separator: " "))"
+    }
+
+    private func removeFromLibrary(_ id: UUID) throws {
+        try db.run("DELETE FROM media WHERE id = ?") { [db] stmt in
+            db.bindText(stmt, 1, id.uuidString)
+        }
+        VideoThumbnail.removeCache(for: id)
+    }
+
+    private func uniqueFileURL(in directory: URL, fileName: String) -> URL {
+        let ext = (fileName as NSString).pathExtension
+        let base = (fileName as NSString).deletingPathExtension
+        var candidate = directory.appendingPathComponent(fileName)
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let name = ext.isEmpty ? "\(base) \(number)" : "\(base) \(number).\(ext)"
+            candidate = directory.appendingPathComponent(name)
+            number += 1
+        }
+        return candidate
+    }
+
     func rename(_ item: MediaItem, to title: String) throws {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -269,6 +370,84 @@ final class LibraryService: ObservableObject {
             host: row["host"]?.string,
             createdAt: Date(timeIntervalSince1970: row["created_at"]?.double ?? 0)
         )
+    }
+}
+
+struct LibraryMoveProgress: Equatable {
+    var index: Int
+    var total: Int
+    var title: String
+    var fraction: Double
+}
+
+private enum FileMover {
+    static func transfer(from source: URL, to dest: URL, onProgress: @escaping @Sendable (Double) -> Void) throws {
+        if sameVolume(source, dest.deletingLastPathComponent()) {
+            try FileManager.default.moveItem(at: source, to: dest)
+            onProgress(1)
+            return
+        }
+        try copyAcrossVolumes(from: source, to: dest, onProgress: onProgress)
+        do {
+            try FileManager.default.removeItem(at: source)
+        } catch {
+            try? FileManager.default.removeItem(at: dest)
+            throw error
+        }
+        onProgress(1)
+    }
+
+    private static func copyAcrossVolumes(from source: URL, to dest: URL, onProgress: @escaping @Sendable (Double) -> Void) throws {
+        let total = (try? FileManager.default.attributesOfItem(atPath: source.path)[.size] as? NSNumber)?.int64Value ?? 0
+        let input = try FileHandle(forReadingFrom: source)
+        defer { try? input.close() }
+        FileManager.default.createFile(atPath: dest.path, contents: nil)
+        let output: FileHandle
+        do {
+            output = try FileHandle(forWritingTo: dest)
+        } catch {
+            try? FileManager.default.removeItem(at: dest)
+            throw error
+        }
+        defer { try? output.close() }
+
+        let chunk = 8 * 1024 * 1024
+        var copied: Int64 = 0
+        var lastFraction = -1.0
+        var lastReport = Date.distantPast
+        do {
+            while true {
+                let data = try input.read(upToCount: chunk) ?? Data()
+                if data.isEmpty { break }
+                try output.write(contentsOf: data)
+                copied += Int64(data.count)
+                let fraction = total > 0 ? min(1, Double(copied) / Double(total)) : 1
+                let now = Date()
+                if fraction >= 1 || fraction - lastFraction >= 0.01 || now.timeIntervalSince(lastReport) >= 0.2 {
+                    lastFraction = fraction
+                    lastReport = now
+                    onProgress(fraction)
+                }
+            }
+        } catch {
+            try? output.close()
+            try? FileManager.default.removeItem(at: dest)
+            throw error
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: source.path) {
+            var kept: [FileAttributeKey: Any] = [:]
+            if let permissions = attrs[.posixPermissions] { kept[.posixPermissions] = permissions }
+            if let modified = attrs[.modificationDate] { kept[.modificationDate] = modified }
+            try? FileManager.default.setAttributes(kept, ofItemAtPath: dest.path)
+        }
+        _ = copyfile(source.path, dest.path, nil, copyfile_flags_t(COPYFILE_METADATA))
+    }
+
+    private static func sameVolume(_ file: URL, _ directory: URL) -> Bool {
+        var left = statfs()
+        var right = statfs()
+        guard statfs(file.path, &left) == 0, statfs(directory.path, &right) == 0 else { return false }
+        return left.f_fsid.val.0 == right.f_fsid.val.0 && left.f_fsid.val.1 == right.f_fsid.val.1
     }
 }
 

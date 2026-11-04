@@ -39,8 +39,6 @@ final class CapturePipeline: NSObject, ObservableObject {
     private var lastAudioPTS = CMTime.invalid
     private var sessionStarted = false
     private var sessionStart = CMTime.zero
-    private var audioConverter: AVAudioConverter?
-    private var audioOutputFormat: AVAudioFormat?
     private var retainedVideo: CMSampleBuffer?
     private var audioWaitStarted: Date?
     private var streamCapturesAudio = false
@@ -290,6 +288,13 @@ final class CapturePipeline: NSObject, ObservableObject {
     }
 
     func startRecording(root: URL, ffmpegPath: String) async {
+        let saving = await MainActor.run {
+            if case .saving = phase { return true }
+            return false
+        }
+        if !saving {
+            discardAbandonedCaptures(root: root)
+        }
         self.ffmpegPath = ffmpegPath
         audioMixNote = nil
         await MainActor.run {
@@ -321,7 +326,7 @@ final class CapturePipeline: NSObject, ObservableObject {
         do {
             try AppPaths.ensureDirectory(AppPaths.incompleteDirectory(root: root))
             let url = AppPaths.incompleteDirectory(root: root)
-                .appendingPathComponent("capture-\(UUID().uuidString).mp4")
+                .appendingPathComponent("capture-\(UUID().uuidString).mov")
             try await ensureStreamForSelection()
             try prepareWriter(url: url)
             recording = true
@@ -370,7 +375,28 @@ final class CapturePipeline: NSObject, ObservableObject {
         await stopActiveStream()
 
         let duration = elapsed
-        let finishedURL: URL = try await withCheckedThrowingContinuation { continuation in
+        let finishedURL: URL
+        do {
+            finishedURL = try await finishWriter()
+        } catch {
+            await discardUnfinishedCapture(error)
+            throw error
+        }
+        teardownWriter()
+        do {
+            let mixedURL = try await mixCapturedAudio(into: finishedURL)
+            await MainActor.run { phase = .ready }
+            await startPreview()
+            return (mixedURL, duration)
+        } catch {
+            await presentCaptureFailure(error)
+            await startPreview()
+            throw error
+        }
+    }
+
+    private func finishWriter() async throws -> URL {
+        try await withCheckedThrowingContinuation { continuation in
             writerLock.lock()
             let writer = self.writer
             let videoInput = self.videoInput
@@ -401,13 +427,51 @@ final class CapturePipeline: NSObject, ObservableObject {
                 }
             }
         }
+    }
+
+    private func discardUnfinishedCapture(_ error: Error) async {
+        await closeSystemAudioFile()
+        let extras = [systemAudioURL, micURL]
+        systemAudioURL = nil
+        micURL = nil
+        writerLock.lock()
+        let written = outputURL
+        writerLock.unlock()
         teardownWriter()
-        let mixedURL = await mixCapturedAudio(into: finishedURL)
+        removeCaptureFiles(written, extras: extras.compactMap { $0 })
+        await presentCaptureFailure(error)
+    }
+
+    private func presentCaptureFailure(_ error: Error) async {
+        let message = (error as? AppError)?.localizedChinese
+            ?? AppError.captureFailed(error.localizedDescription).localizedChinese
         await MainActor.run {
-            phase = .ready
+            lastError = message
+            phase = .failed(message)
         }
-        await startPreview()
-        return (mixedURL, duration)
+    }
+
+    func discardAbandonedCaptures(root: URL) {
+        guard !recording else { return }
+        let folder = AppPaths.incompleteDirectory(root: root)
+        guard let names = try? FileManager.default.contentsOfDirectory(atPath: folder.path) else { return }
+        for name in names where name.hasPrefix("capture-") {
+            try? FileManager.default.removeItem(at: folder.appendingPathComponent(name))
+        }
+    }
+
+    private func removeCaptureFiles(_ video: URL?, extras: [URL]) {
+        var urls = extras
+        if let video {
+            urls.append(video)
+            let stem = video.deletingPathExtension().lastPathComponent
+            let folder = video.deletingLastPathComponent()
+            urls.append(folder.appendingPathComponent(stem + "-mix.mov"))
+            urls.append(folder.appendingPathComponent(stem + "-mix.mp4"))
+        }
+        for url in urls {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 
     func cancelWithoutSaving() async {
@@ -570,8 +634,8 @@ final class CapturePipeline: NSObject, ObservableObject {
         if FileManager.default.fileExists(atPath: url.path) {
             try FileManager.default.removeItem(at: url)
         }
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        writer.shouldOptimizeForNetworkUse = true
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        writer.shouldOptimizeForNetworkUse = false
         writerLock.lock()
         self.writer = writer
         self.videoInput = nil
@@ -584,8 +648,6 @@ final class CapturePipeline: NSObject, ObservableObject {
         self.lastAudioPTS = .invalid
         self.retainedVideo = nil
         self.audioWaitStarted = nil
-        self.audioConverter = nil
-        self.audioOutputFormat = nil
         writerLock.unlock()
     }
 
@@ -650,8 +712,6 @@ final class CapturePipeline: NSObject, ObservableObject {
         lastAudioPTS = .invalid
         retainedVideo = nil
         audioWaitStarted = nil
-        audioConverter = nil
-        audioOutputFormat = nil
         writerLock.unlock()
     }
 
@@ -940,7 +1000,7 @@ final class CapturePipeline: NSObject, ObservableObject {
         }
     }
 
-    private func mixCapturedAudio(into video: URL) async -> URL {
+    private func mixCapturedAudio(into video: URL) async throws -> URL {
         await closeSystemAudioFile()
         let systemURL = systemAudioURL
         let microphoneURL = micURL
@@ -961,7 +1021,7 @@ final class CapturePipeline: NSObject, ObservableObject {
             }
             return video
         }
-        let muxed = video.deletingLastPathComponent().appendingPathComponent(video.deletingPathExtension().lastPathComponent + "-mix.mp4")
+        let muxed = video.deletingLastPathComponent().appendingPathComponent(video.deletingPathExtension().lastPathComponent + "-mix.mov")
         var arguments = ["-y", "-i", video.path]
         tracks.forEach { arguments += ["-i", $0.path] }
         if tracks.count == 1 {
@@ -976,17 +1036,24 @@ final class CapturePipeline: NSObject, ObservableObject {
             ]
         }
         arguments += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", muxed.path]
-        let result = try? await ProcessRunner.run(
-            executable: ffmpeg,
-            arguments: arguments,
-            timeout: 60 * 30
-        )
-        tracks.forEach { try? FileManager.default.removeItem(at: $0) }
-        guard result?.exitCode == 0, FileManager.default.fileExists(atPath: muxed.path) else {
-            try? FileManager.default.removeItem(at: muxed)
-            audioMixNote = "畫面已存好。聲音沒有併進檔案。"
-            return video
+        let result: ProcessResult
+        do {
+            result = try await ProcessRunner.run(
+                executable: ffmpeg,
+                arguments: arguments,
+                timeout: 60 * 30
+            )
+        } catch {
+            removeCaptureFiles(video, extras: tracks)
+            throw AppError.captureFailed("併入聲音失敗，檔案已刪除。\(error.localizedDescription)")
         }
+        guard result.exitCode == 0, FileManager.default.fileExists(atPath: muxed.path) else {
+            let lines = result.stderr.split { $0 == "\n" || $0 == "\r" }
+            let tail = lines.suffix(2).joined(separator: " ")
+            removeCaptureFiles(video, extras: tracks)
+            throw AppError.captureFailed(tail.isEmpty ? "併入聲音失敗，檔案已刪除。" : "併入聲音失敗，檔案已刪除：\(tail)")
+        }
+        tracks.forEach { try? FileManager.default.removeItem(at: $0) }
         try? FileManager.default.removeItem(at: video)
         do {
             try FileManager.default.moveItem(at: muxed, to: video)
