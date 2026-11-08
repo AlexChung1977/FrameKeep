@@ -13,12 +13,18 @@ final class CapturePipeline: NSObject, ObservableObject {
     @Published var selectedDisplayID: CGDirectDisplayID?
     @Published var includeMicrophone = false
     @Published var includeSystemAudio = true
+    /// Capture HDR frames when the display and OS support ScreenCaptureKit HDR.
+    @Published var captureHDR = false
+    /// Manual capture FPS; `auto` tracks the display (60 / 120 with HDR).
+    @Published var preferredCaptureFPS: CaptureFPSChoice = .auto
     @Published var elapsed: TimeInterval = 0
     @Published var audioLevel: Float = 0
     @Published var previewImage: NSImage?
     @Published var permission = CapturePermissionState.unknown
     @Published var hint: String = "請先在瀏覽器播放要收錄的內容，再開始擷取。"
     @Published var lastError: String?
+    /// Actual encode/capture FPS for the active or last configured stream.
+    @Published private(set) var activeCaptureFPS: Int = 60
 
     private let videoQueue = DispatchQueue(label: "app.framekeep.capture.video")
     private let audioQueue = DispatchQueue(label: "app.framekeep.capture.audio")
@@ -58,6 +64,7 @@ final class CapturePipeline: NSObject, ObservableObject {
     private var previewCounter = 0
     private var previewInFlight = false
     private var captureFPS: Int32 = 60
+    private var recordingHDR = false
     private var audioEngine: AVAudioEngine?
     private var recording = false
     private var paused = false
@@ -85,6 +92,20 @@ final class CapturePipeline: NSObject, ObservableObject {
 
     var selectedDisplay: CaptureDisplay? {
         displays.first(where: { $0.id == selectedDisplayID }) ?? displays.first
+    }
+
+    var availableCaptureFPSChoices: [CaptureFPSChoice] {
+        CaptureFPSChoice.available(
+            displayHz: selectedDisplay?.refreshRateHz ?? 60,
+            hdr: captureHDR
+        )
+    }
+
+    var plannedCaptureFPS: Int {
+        preferredCaptureFPS.resolvedFPS(
+            displayHz: selectedDisplay?.refreshRateHz ?? 60,
+            hdr: captureHDR
+        )
     }
 
     func refreshPermissions() {
@@ -164,6 +185,7 @@ final class CapturePipeline: NSObject, ObservableObject {
                     name: Self.screenName(for: display.displayID),
                     width: pixels.width,
                     height: pixels.height,
+                    refreshRateHz: Self.displayRefreshRateHz(for: display.displayID),
                     isMain: CGMainDisplayID() == display.displayID
                 )
             }
@@ -235,7 +257,7 @@ final class CapturePipeline: NSObject, ObservableObject {
         } catch {
             guard generation == previewGeneration else { return }
             await MainActor.run {
-                lastError = AppError.captureFailed(error.localizedDescription).localizedChinese
+                lastError = Self.captureMessage(error)
                 phase = .failed(self.lastError ?? "")
             }
         }
@@ -518,9 +540,15 @@ final class CapturePipeline: NSObject, ObservableObject {
                 }
                 return
             } catch {
-                try await openStream(displayID: displayID, captureAudio: false)
-                await MainActor.run { hint = Self.displayWithoutAudioHint }
-                return
+                AppLog.error("capture with system audio failed, retrying silent: \(Self.describe(error))")
+                do {
+                    try await openStream(displayID: displayID, captureAudio: false)
+                    await MainActor.run { hint = Self.displayWithoutAudioHint }
+                    return
+                } catch {
+                    AppLog.error("capture without system audio also failed: \(Self.describe(error))")
+                    throw error
+                }
             }
         }
         try await openStream(displayID: displayID, captureAudio: false)
@@ -534,26 +562,45 @@ final class CapturePipeline: NSObject, ObservableObject {
             throw AppError.captureFailed("找不到可擷取的顯示器。")
         }
 
-        let size = Self.nativePixelSize(for: display)
-        let fps = Self.captureFrameRate(for: display.displayID)
+        let ownWindows = content.windows.filter {
+            $0.owningApplication?.bundleIdentifier == Bundle.main.bundleIdentifier
+        }
+        let filter = SCContentFilter(display: display, excludingWindows: ownWindows)
+        let size = Self.capturePixelSize(display: display, filter: filter)
+        let (wantHDR, fpsChoice) = await MainActor.run { (captureHDR, preferredCaptureFPS) }
+        let displayHz = Self.displayRefreshRateHz(for: display.displayID)
+        let fps = Int32(fpsChoice.resolvedFPS(displayHz: displayHz, hdr: wantHDR))
         captureFPS = fps
-        let filter = SCContentFilter(display: display, excludingWindows: [])
-        let config = SCStreamConfiguration()
+        await MainActor.run { activeCaptureFPS = Int(fps) }
+        recordingHDR = false
+        let config: SCStreamConfiguration
+        if wantHDR, let hdrConfig = Self.makeHDRConfiguration() {
+            config = hdrConfig
+            recordingHDR = true
+        } else {
+            config = SCStreamConfiguration()
+            config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+            if #available(macOS 14.0, *) {
+                config.colorSpaceName = CGColorSpace.sRGB
+            }
+        }
         config.width = size.width
         config.height = size.height
         config.minimumFrameInterval = CMTime(value: 1, timescale: fps)
         config.queueDepth = 8
         config.showsCursor = true
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         config.capturesAudio = captureAudio
         if #available(macOS 14.0, *) {
             config.captureResolution = .best
-            config.colorSpaceName = CGColorSpace.sRGB
         }
         if #available(macOS 13.0, *) {
             config.sampleRate = 48000
             config.channelCount = 2
         }
+
+        AppLog.info(
+            "capture stream display=\(display.displayID) \(size.width)x\(size.height) fps=\(fps) hdr=\(recordingHDR) audio=\(captureAudio)"
+        )
 
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         activeStream = stream
@@ -567,6 +614,7 @@ final class CapturePipeline: NSObject, ObservableObject {
             streamDisplayID = display.displayID
             streamCapturesAudio = captureAudio
         } catch {
+            AppLog.error("capture stream failed: \(Self.describe(error))")
             if activeStream === stream {
                 activeStream = nil
             }
@@ -575,39 +623,77 @@ final class CapturePipeline: NSObject, ObservableObject {
         }
     }
 
+    /// Prefer the display mode's true pixel size. On Retina / PROLED, `CGDisplayPixelsWide`
+    /// often returns the "looks like" size (e.g. 1497×977) which breaks ScreenCaptureKit.
     private static func nativePixelSize(for display: SCDisplay) -> (width: Int, height: Int) {
+        capturePixelSize(display: display, filter: nil)
+    }
+
+    private static func capturePixelSize(display: SCDisplay, filter: SCContentFilter?) -> (width: Int, height: Int) {
+        // Display mode pixel size is the true framebuffer (e.g. 2994×1954 on
+        // PROLED). CGDisplayPixelsWide often returns the "looks like" size.
+        if let mode = CGDisplayCopyDisplayMode(display.displayID) {
+            let width = Int(mode.pixelWidth)
+            let height = Int(mode.pixelHeight)
+            if width > 1, height > 1 {
+                return evenPixelSize(width: width, height: height)
+            }
+        }
+        if #available(macOS 14.0, *), let filter {
+            let scale = CGFloat(filter.pointPixelScale)
+            let width = Int((filter.contentRect.width * scale).rounded())
+            let height = Int((filter.contentRect.height * scale).rounded())
+            if width > 1, height > 1 {
+                return evenPixelSize(width: width, height: height)
+            }
+        }
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  CGDirectDisplayID(truncating: number) == display.displayID else { continue }
+            let bounds = screen.frame
+            let scale = screen.backingScaleFactor
+            return evenPixelSize(
+                width: Int((bounds.width * scale).rounded()),
+                height: Int((bounds.height * scale).rounded())
+            )
+        }
         let wide = Int(CGDisplayPixelsWide(display.displayID))
         let high = Int(CGDisplayPixelsHigh(display.displayID))
         if wide > 1, high > 1 {
             return evenPixelSize(width: wide, height: high)
         }
-        var scale: CGFloat = 2
-        for screen in NSScreen.screens {
-            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
-                  CGDirectDisplayID(truncating: number) == display.displayID else { continue }
-            scale = screen.backingScaleFactor
-            break
-        }
-        return evenPixelSize(
-            width: Int((CGFloat(display.width) * scale).rounded()),
-            height: Int((CGFloat(display.height) * scale).rounded())
-        )
+        return evenPixelSize(width: display.width * 2, height: display.height * 2)
     }
 
     private static func evenPixelSize(width: Int, height: Int) -> (width: Int, height: Int) {
         (max(2, width / 2 * 2), max(2, height / 2 * 2))
     }
 
-    /// ScreenCaptureKit will not deliver frames faster than this. ProMotion
-    /// reports 0, so those displays record at 60. The saved file keeps the
-    /// timestamps of the frames that actually arrive.
-    private static func captureFrameRate(for displayID: CGDirectDisplayID) -> Int32 {
+    private static func makeHDRConfiguration() -> SCStreamConfiguration? {
+        if #available(macOS 26.0, *) {
+            // Best for writing HDR10 MOV that still looks right on SDR playback.
+            return SCStreamConfiguration(preset: .captureHDRRecordingPreservedSDRHDR10)
+        }
+        if #available(macOS 15.0, *) {
+            return SCStreamConfiguration(preset: .captureHDRStreamLocalDisplay)
+        }
+        return nil
+    }
+
+    /// Native panel refresh (ProMotion often reports 0 from CGDisplay; use NSScreen).
+    private static func displayRefreshRateHz(for displayID: CGDirectDisplayID) -> Int {
         var rate = 60.0
         if let mode = CGDisplayCopyDisplayMode(displayID) {
             let refresh = mode.refreshRate
             if refresh >= 30 { rate = refresh }
         }
-        return Int32(min(60, max(30, rate.rounded())))
+        for screen in NSScreen.screens {
+            guard let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  CGDirectDisplayID(truncating: number) == displayID else { continue }
+            rate = max(rate, Double(screen.maximumFramesPerSecond))
+            break
+        }
+        return Int(max(30, rate.rounded()))
     }
 
     private func startStream(_ stream: SCStream) async throws {
@@ -832,24 +918,38 @@ final class CapturePipeline: NSObject, ObservableObject {
         let height = CVPixelBufferGetHeight(pixel)
         guard width > 1, height > 1, width.isMultiple(of: 2), height.isMultiple(of: 2) else { return }
         let fps = captureFPS
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: [
-            AVVideoCodecKey: AVVideoCodecType.h264,
+        let useHDR = recordingHDR
+        var settings: [String: Any] = [
+            AVVideoCodecKey: useHDR ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
             AVVideoWidthKey: width,
             AVVideoHeightKey: height,
             AVVideoCompressionPropertiesKey: [
-                AVVideoAverageBitRateKey: Self.videoBitrate(width: width, height: height, fps: fps),
+                AVVideoAverageBitRateKey: Self.videoBitrate(width: width, height: height, fps: fps, hdr: useHDR),
                 AVVideoExpectedSourceFrameRateKey: fps,
                 AVVideoMaxKeyFrameIntervalKey: fps,
-                AVVideoAllowFrameReorderingKey: false,
-                AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel
+                AVVideoAllowFrameReorderingKey: false
             ]
-        ])
+        ]
+        if useHDR {
+            settings[AVVideoColorPropertiesKey] = [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020
+            ]
+        } else if var compression = settings[AVVideoCompressionPropertiesKey] as? [String: Any] {
+            compression[AVVideoProfileLevelKey] = AVVideoProfileLevelH264HighAutoLevel
+            settings[AVVideoCompressionPropertiesKey] = compression
+        }
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
         input.expectsMediaDataInRealTime = true
         guard writer.canAdd(input) else { return }
         writer.add(input)
         videoInput = input
+        let pixelFormat: OSType = useHDR
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         pixelAdaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelBufferPixelFormatTypeKey as String: pixelFormat,
             kCVPixelBufferWidthKey as String: width,
             kCVPixelBufferHeightKey as String: height
         ])
@@ -1079,13 +1179,14 @@ final class CapturePipeline: NSObject, ObservableObject {
         return "擷取失敗：\(describe(error))"
     }
 
-    private static func videoBitrate(width: Int, height: Int, fps: Int32) -> Int {
+    private static func videoBitrate(width: Int, height: Int, fps: Int32, hdr: Bool = false) -> Int {
         let pixels = width * height
-        let base: Int
+        var base: Int
         if pixels >= 8_000_000 { base = 40_000_000 }
         else if pixels >= 3_500_000 { base = 24_000_000 }
         else if pixels >= 2_000_000 { base = 16_000_000 }
         else { base = 8_000_000 }
+        if hdr { base = base * 5 / 4 }
         return fps >= 50 ? base * 3 / 2 : base
     }
 

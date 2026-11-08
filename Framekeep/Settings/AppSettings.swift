@@ -53,6 +53,9 @@ final class AppSettings: ObservableObject {
     @Published var ytdlpPath: String
     @Published var ffmpegPath: String
     @Published var includeMicrophoneByDefault: Bool
+    /// Prefer HDR ScreenCaptureKit + HEVC when the display supports it (PROLED / XDR).
+    @Published var captureHDRByDefault: Bool
+    @Published var captureFPSChoice: CaptureFPSChoice
     @Published var trimOutputDirectory: String
     @Published var folderFavorites: [FolderFavorite]
 
@@ -77,6 +80,13 @@ final class AppSettings: ObservableObject {
         ytdlpPath = defaults.string(forKey: Key.ytdlpPath) ?? ""
         ffmpegPath = defaults.string(forKey: Key.ffmpegPath) ?? ""
         includeMicrophoneByDefault = defaults.bool(forKey: Key.includeMic)
+        captureHDRByDefault = defaults.object(forKey: Key.captureHDR) as? Bool ?? false
+        if let fps = defaults.object(forKey: Key.captureFPS) as? Int,
+           let choice = CaptureFPSChoice(rawValue: fps) {
+            captureFPSChoice = choice
+        } else {
+            captureFPSChoice = .auto
+        }
         trimOutputDirectory = defaults.string(forKey: Key.trimOutput) ?? ""
         folderFavorites = Self.loadFolderFavorites(defaults)
 
@@ -89,6 +99,8 @@ final class AppSettings: ObservableObject {
         $ytdlpPath.sink { [weak self] in self?.defaults.set($0, forKey: Key.ytdlpPath) }.store(in: &cancellables)
         $ffmpegPath.sink { [weak self] in self?.defaults.set($0, forKey: Key.ffmpegPath) }.store(in: &cancellables)
         $includeMicrophoneByDefault.sink { [weak self] in self?.defaults.set($0, forKey: Key.includeMic) }.store(in: &cancellables)
+        $captureHDRByDefault.sink { [weak self] in self?.defaults.set($0, forKey: Key.captureHDR) }.store(in: &cancellables)
+        $captureFPSChoice.sink { [weak self] in self?.defaults.set($0.rawValue, forKey: Key.captureFPS) }.store(in: &cancellables)
         $trimOutputDirectory.sink { [weak self] in self?.defaults.set($0, forKey: Key.trimOutput) }.store(in: &cancellables)
         $folderFavorites.sink { [weak self] favorites in
             guard let data = try? JSONEncoder().encode(Array(favorites.prefix(10))) else { return }
@@ -164,6 +176,8 @@ final class AppSettings: ObservableObject {
         static let ytdlpPath = "settings.ytdlpPath"
         static let ffmpegPath = "settings.ffmpegPath"
         static let includeMic = "settings.includeMic"
+        static let captureHDR = "settings.captureHDR"
+        static let captureFPS = "settings.captureFPS"
         static let trimOutput = "settings.trimOutputDirectory"
         static let folderFavorites = "settings.folderFavorites"
     }

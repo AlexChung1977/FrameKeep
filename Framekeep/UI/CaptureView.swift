@@ -4,6 +4,7 @@ import SwiftUI
 struct CaptureView: View {
     @EnvironmentObject private var app: AppState
     @EnvironmentObject private var capture: CapturePipeline
+    @EnvironmentObject private var settings: AppSettings
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -13,7 +14,22 @@ struct CaptureView: View {
         }
         .background(FKColor.graphite)
         .onAppear {
+            if case .idle = capture.phase {
+                capture.captureHDR = settings.captureHDRByDefault
+                capture.preferredCaptureFPS = settings.captureFPSChoice
+            }
+            clampPreferredFPS()
             Task { await capture.prepareIfPermitted() }
+        }
+        .onChange(of: capture.captureHDR) { _ in
+            clampPreferredFPS()
+            settings.captureHDRByDefault = capture.captureHDR
+        }
+        .onChange(of: capture.preferredCaptureFPS) { newValue in
+            settings.captureFPSChoice = newValue
+        }
+        .onChange(of: capture.selectedDisplayID) { _ in
+            clampPreferredFPS()
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             Task { await capture.prepareIfPermitted() }
@@ -81,10 +97,19 @@ struct CaptureView: View {
                     .disabled(capture.phase == .recording || capture.phase == .paused || capture.phase == .saving)
                 }
 
+                fpsPicker
+
                 Toggle("系統音訊", isOn: $capture.includeSystemAudio)
                     .toggleStyle(.checkbox)
+                    .frame(minHeight: FKTouch.minTarget)
                 Toggle("麥克風", isOn: $capture.includeMicrophone)
                     .toggleStyle(.checkbox)
+                    .frame(minHeight: FKTouch.minTarget)
+                Toggle("HDR", isOn: $capture.captureHDR)
+                    .toggleStyle(.checkbox)
+                    .help("以 ScreenCaptureKit HDR + HEVC 擷取，適合 PROLED／XDR 螢幕。檔案較大。")
+                    .frame(minHeight: FKTouch.minTarget)
+                    .disabled(capture.phase == .recording || capture.phase == .paused || capture.phase == .saving)
 
                 audioMeter
 
@@ -119,6 +144,47 @@ struct CaptureView: View {
         .overlay(Divider().background(FKColor.line), alignment: .top)
     }
 
+    private var fpsPicker: some View {
+        let displayHz = capture.selectedDisplay?.refreshRateHz ?? 0
+        let captureFPS = isActivelyCapturing ? capture.activeCaptureFPS : capture.plannedCaptureFPS
+        return HStack(spacing: 8) {
+            if displayHz > 0 {
+                Text("螢幕 \(displayHz)Hz")
+                    .font(FKFont.body(12, weight: .medium))
+                    .foregroundStyle(FKColor.paperMuted)
+                    .monospacedDigit()
+            }
+            Picker("幀率", selection: $capture.preferredCaptureFPS) {
+                ForEach(capture.availableCaptureFPSChoices) { choice in
+                    Text(choice.title).tag(choice)
+                }
+            }
+            .labelsHidden()
+            .frame(minWidth: 88)
+            .disabled(isActivelyCapturing)
+            Text(isActivelyCapturing ? "擷取 \(captureFPS)fps" : "→ \(captureFPS)fps")
+                .font(FKFont.body(12, weight: .medium))
+                .foregroundStyle(FKColor.amber)
+                .monospacedDigit()
+                .help("可自訂擷取幀率。不會超過螢幕原生更新率；未開 HDR 時最高 60fps。")
+        }
+        .frame(minHeight: FKTouch.minTarget)
+    }
+
+    private var isActivelyCapturing: Bool {
+        switch capture.phase {
+        case .recording, .paused, .saving: return true
+        default: return false
+        }
+    }
+
+    private func clampPreferredFPS() {
+        let allowed = capture.availableCaptureFPSChoices
+        if !allowed.contains(capture.preferredCaptureFPS) {
+            capture.preferredCaptureFPS = .auto
+        }
+    }
+
     private var audioMeter: some View {
         GeometryReader { geo in
             ZStack(alignment: .leading) {
@@ -138,13 +204,14 @@ struct CaptureView: View {
             ZStack {
                 Circle()
                     .fill(FKColor.graphitePanel)
-                    .frame(width: 36, height: 36)
+                    .frame(width: FKTouch.minTarget, height: FKTouch.minTarget)
                     .overlay(Circle().stroke(FKColor.line, lineWidth: 1))
                 Circle()
                     .fill(recordFill)
                     .frame(width: 16, height: 16)
                     .scaleEffect(pulse ? 1.08 : 1)
             }
+            .contentShape(Circle())
         }
         .buttonStyle(.plain)
         .disabled(capture.phase == .recording || capture.phase == .saving)

@@ -58,6 +58,8 @@ final class AppState: ObservableObject {
         library = LibraryService(db: store, settings: settings)
         capture = CapturePipeline()
         capture.includeMicrophone = settings.includeMicrophoneByDefault
+        capture.captureHDR = settings.captureHDRByDefault
+        capture.preferredCaptureFPS = settings.captureFPSChoice
         capture.discardAbandonedCaptures(root: settings.moviesRootURL)
 
         BrowserLinkCenter.shared.bind { [weak self] url in

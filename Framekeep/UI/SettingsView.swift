@@ -77,6 +77,15 @@ struct SettingsView: View {
 
                 section("擷取") {
                     Toggle("預設一併錄麥克風", isOn: $settings.includeMicrophoneByDefault)
+                    Toggle("預設啟用 HDR 擷取（PROLED／XDR）", isOn: $settings.captureHDRByDefault)
+                    Picker("預設幀率", selection: $settings.captureFPSChoice) {
+                        ForEach(CaptureFPSChoice.allCases) { choice in
+                            Text(choice.title).tag(choice)
+                        }
+                    }
+                    Text("HDR 使用 ScreenCaptureKit 高動態範圍與 HEVC，適合新款 OLED MacBook；檔案較大，舊螢幕可關閉。幀率不會超過螢幕原生更新率；未開 HDR 時最高 60fps。")
+                        .font(FKFont.body(11))
+                        .foregroundStyle(FKColor.paperFaint)
                 }
 
                 section("瀏覽器右鍵") {

@@ -35,6 +35,14 @@ enum FKFont {
     }
 }
 
+/// Touch on Mac guidance: 36pt physical hit target (same size as 44pt on iOS).
+enum FKTouch {
+    static let minTarget: CGFloat = 36
+    static let handleWidth: CGFloat = 18
+    static let handleHeight: CGFloat = 36
+    static let rangeBarHeight: CGFloat = 36
+}
+
 extension View {
     func fkCard(corner: CGFloat = 10) -> some View {
         background(FKColor.graphiteElevated)

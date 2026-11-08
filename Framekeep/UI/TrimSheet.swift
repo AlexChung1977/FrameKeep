@@ -34,11 +34,13 @@ struct TrimSheet: View {
                 if session.isPlayingPreview {
                     PlayerHost(player: session.player)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .scaleEffect(session.previewScale)
                 } else if let image = session.scrubImage {
                     Image(nsImage: image)
                         .resizable()
                         .scaledToFit()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .scaleEffect(session.previewScale)
                         .id(session.scrubRevision)
                 }
                 if !session.isPlayingPreview {
@@ -64,6 +66,25 @@ struct TrimSheet: View {
             .layoutPriority(1)
             .background(Color.black)
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .contentShape(Rectangle())
+            .gesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        session.previewScale = min(3, max(1, value))
+                    }
+                    .onEnded { _ in
+                        withAnimation(.easeOut(duration: 0.18)) {
+                            if session.previewScale < 1.08 {
+                                session.previewScale = 1
+                            }
+                        }
+                    }
+            )
+            .onTapGesture(count: 2) {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    session.previewScale = 1
+                }
+            }
 
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -336,7 +357,7 @@ private struct TrimRangeBar: View {
     var body: some View {
         GeometryReader { geo in
             let width = max(geo.size.width, 1)
-            let inset: CGFloat = 7
+            let inset = FKTouch.handleWidth / 2
             let track = max(width - inset * 2, 1)
             let span = max(duration, 0.2)
             let playX = inset + track * CGFloat(min(max(playhead, 0), span) / span)
@@ -360,7 +381,7 @@ private struct TrimRangeBar: View {
                     )
                 Capsule()
                     .fill(Color.white.opacity(0.16))
-                    .frame(height: 8)
+                    .frame(height: 12)
                     .padding(.horizontal, inset)
                     .allowsHitTesting(false)
 
@@ -369,14 +390,14 @@ private struct TrimRangeBar: View {
                     let eX = inset + track * CGFloat(min(max(segment.1, 0), span) / span)
                     Capsule()
                         .fill(index == selectedIndex ? FKColor.amber : FKColor.amber.opacity(0.35))
-                        .frame(width: max(eX - sX, 4), height: 8)
+                        .frame(width: max(eX - sX, 4), height: 12)
                         .offset(x: sX)
                         .allowsHitTesting(false)
                 }
 
                 Rectangle()
                     .fill(Color.white.opacity(0.9))
-                    .frame(width: 2, height: 18)
+                    .frame(width: 2, height: 24)
                     .offset(x: playX - 1)
                     .allowsHitTesting(false)
 
@@ -391,17 +412,18 @@ private struct TrimRangeBar: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(height: 28)
+        .frame(height: FKTouch.rangeBarHeight)
     }
 
     private var handle: some View {
-        RoundedRectangle(cornerRadius: 2, style: .continuous)
+        RoundedRectangle(cornerRadius: 4, style: .continuous)
             .fill(FKColor.amber)
-            .frame(width: 12, height: 22)
+            .frame(width: FKTouch.handleWidth, height: FKTouch.handleHeight)
             .overlay(
-                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
                     .stroke(Color.white.opacity(0.85), lineWidth: 1)
             )
+            .contentShape(Rectangle())
     }
 
     private func hitSegment(at seconds: Double) -> Int? {
@@ -469,6 +491,7 @@ final class TrimSession: ObservableObject {
     @Published var scrubCaption = ""
     @Published var scrubRevision = 0
     @Published var isPlayingPreview = false
+    @Published var previewScale: CGFloat = 1
     var exportHandle: ProcessRunner.Handle?
 
     private var timeToken: Any?
