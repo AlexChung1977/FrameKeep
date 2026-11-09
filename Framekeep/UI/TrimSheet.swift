@@ -31,7 +31,7 @@ struct TrimSheet: View {
 
             ZStack {
                 Color.black
-                if session.isPlayingPreview {
+                if session.showsPlayer {
                     PlayerHost(player: session.player)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .scaleEffect(session.previewScale)
@@ -46,7 +46,7 @@ struct TrimSheet: View {
                 if !session.isPlayingPreview {
                     VStack {
                         HStack {
-                            Text(session.scrubCaption.isEmpty ? "正在讀取預覽…" : session.scrubCaption)
+                            Text(previewCaption)
                                 .font(FKFont.body(11, weight: .medium))
                                 .foregroundStyle(FKColor.paper)
                                 .padding(.horizontal, 8)
@@ -70,11 +70,11 @@ struct TrimSheet: View {
             .gesture(
                 MagnificationGesture()
                     .onChanged { value in
-                        session.previewScale = min(3, max(1, value))
+                        session.previewScale = min(3, max(0.5, value))
                     }
                     .onEnded { _ in
                         withAnimation(.easeOut(duration: 0.18)) {
-                            if session.previewScale < 1.08 {
+                            if session.previewScale < 1.05 || session.previewScale > 2.8 {
                                 session.previewScale = 1
                             }
                         }
@@ -192,6 +192,16 @@ struct TrimSheet: View {
             session.scheduleScrub(at: session.start, label: "起點", ffmpegPath: app.settings.ffmpegPath)
         }
         .onDisappear { session.stop() }
+    }
+
+    private var previewCaption: String {
+        if !session.scrubCaption.isEmpty {
+            return session.scrubCaption
+        }
+        if session.showsPlayer {
+            return "預覽"
+        }
+        return "正在讀取預覽…"
     }
 
     private var segmentList: some View {
@@ -492,7 +502,12 @@ final class TrimSession: ObservableObject {
     @Published var scrubRevision = 0
     @Published var isPlayingPreview = false
     @Published var previewScale: CGFloat = 1
+    @Published private(set) var canUseNativePreview = false
     var exportHandle: ProcessRunner.Handle?
+
+    var showsPlayer: Bool {
+        isPlayingPreview || canUseNativePreview
+    }
 
     private var timeToken: Any?
     private var playingSelection = false
@@ -570,7 +585,11 @@ final class TrimSession: ObservableObject {
         guard !playbackModeLoaded else { return }
         let asset = AVURLAsset(url: item.fileURL)
         nativePlayback = (try? await asset.load(.isPlayable)) ?? false
+        canUseNativePreview = nativePlayback
         playbackModeLoaded = true
+        if nativePlayback {
+            seek(to: playhead)
+        }
     }
 
     func loadDuration(using library: LibraryService) async {
@@ -664,6 +683,8 @@ final class TrimSession: ObservableObject {
                 guard let target = scrubRequested else { break }
                 let caption = "\(scrubLabel) \(Self.clock(target))"
                 scrubRequested = nil
+                // Prefer ffmpeg stills; if missing (common with user Homebrew paths),
+                // native seek already updates AVPlayer which is shown via showsPlayer.
                 let data = await VideoTrimmer.previewJPEG(url: source, seconds: target, ffmpegPath: ffmpegPath)
                 guard generation == scrubGeneration, !scrubStopped else { return }
                 if scrubRequested != nil { continue }
@@ -671,6 +692,10 @@ final class TrimSession: ObservableObject {
                     scrubImage = image
                     scrubCaption = caption
                     scrubRevision += 1
+                } else if !self.nativePlayback {
+                    scrubCaption = "無法讀取預覽影格"
+                } else {
+                    scrubCaption = caption
                 }
                 if scrubRequested == nil { break }
             }

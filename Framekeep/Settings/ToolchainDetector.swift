@@ -52,8 +52,10 @@ final class ToolchainDetector: ObservableObject {
         if !preferred.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             candidates.append(preferred)
         }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
         for name in names {
             candidates.append(contentsOf: [
+                "\(home)/.homebrew/bin/\(name)",
                 "/opt/homebrew/bin/\(name)",
                 "/usr/local/bin/\(name)",
                 "/opt/local/bin/\(name)",

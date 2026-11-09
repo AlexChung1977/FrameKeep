@@ -10,8 +10,9 @@ struct AmberButton: View {
         Button(action: action) {
             Text(title)
                 .font(FKFont.body(13, weight: .semibold))
-                .frame(minHeight: FKTouch.minTarget)
                 .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+                .frame(minHeight: FKTouch.minTarget)
                 .background(prominent ? (enabled ? FKColor.amber : FKColor.amber.opacity(0.35)) : Color.clear)
                 .foregroundStyle(prominent ? FKColor.graphite : FKColor.paper)
                 .overlay(
@@ -29,6 +30,8 @@ struct AmberButton: View {
 struct GhostButton: View {
     let title: String
     var role: ButtonRole? = nil
+    /// Dense rows (queue / library) keep a smaller footprint; primary chrome keeps 36pt hits.
+    var compact: Bool = false
     let action: () -> Void
 
     var body: some View {
@@ -36,8 +39,9 @@ struct GhostButton: View {
             Text(title)
                 .font(FKFont.body(12, weight: .medium))
                 .foregroundStyle(role == .destructive ? FKColor.danger : FKColor.paperMuted)
-                .frame(minHeight: FKTouch.minTarget)
-                .padding(.horizontal, 8)
+                .padding(.horizontal, compact ? 4 : 8)
+                .padding(.vertical, compact ? 4 : 8)
+                .frame(minHeight: compact ? 24 : FKTouch.minTarget)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)

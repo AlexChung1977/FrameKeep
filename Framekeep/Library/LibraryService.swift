@@ -565,7 +565,14 @@ enum VideoThumbnail {
     }
 
     static func ffmpegExecutable(preferred: String) -> URL? {
-        var candidates = [preferred, "/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/local/bin/ffmpeg"]
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        var candidates = [
+            preferred,
+            "\(home)/.homebrew/bin/ffmpeg",
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/opt/local/bin/ffmpeg"
+        ]
         candidates = candidates.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
         for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
             return URL(fileURLWithPath: path)

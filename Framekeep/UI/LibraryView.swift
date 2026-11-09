@@ -79,6 +79,8 @@ struct LibraryView: View {
             VStack {
                 Button(action: selectAll) {}
                     .keyboardShortcut("a", modifiers: .command)
+                Button(action: openSelection) {}
+                    .keyboardShortcut(.defaultAction)
                 Button(action: { remove(selection, deleteFile: false) }) {}
                     .keyboardShortcut(.delete)
             }
@@ -186,6 +188,12 @@ struct LibraryView: View {
         selectionAnchor = library.visibleItems.first?.id
     }
 
+    private func openSelection() {
+        let items = library.visibleItems.filter { selection.contains($0.id) }
+        guard !items.isEmpty else { return }
+        library.open(items)
+    }
+
     private func targets(including id: MediaItem.ID) -> [MediaItem] {
         let ids = selection.contains(id) ? selection : [id]
         return library.visibleItems.filter { ids.contains($0.id) }
@@ -237,6 +245,7 @@ private struct LibraryCard: View {
     var onMove: ([MediaItem]) -> Void
     var targets: () -> [MediaItem]
     @State private var thumbnail: NSImage?
+    @State private var lastTapAt: Date?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -288,8 +297,13 @@ private struct LibraryCard: View {
                 .stroke(isSelected ? FKColor.amber : Color.clear, lineWidth: 2)
                 .allowsHitTesting(false)
         }
-        .onTapGesture(count: 2, perform: onOpen)
-        .onTapGesture(perform: onSelect)
+        .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+        // Time-window double tap keeps ScrollView / Touch scrolling working.
+        // (NSView click overlays were eating pan and scroll.)
+        .onTapGesture(perform: handleTap)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("點兩下或輕點兩次可開啟檔案")
+        .help("點兩下開啟檔案（觸控螢幕：輕點兩次）")
         .task(id: item.filePath) {
             let ffmpegPath = app.settings.ffmpegPath
             guard let data = await VideoThumbnail.jpeg(for: item, ffmpegPath: ffmpegPath) else { return }
@@ -322,6 +336,18 @@ private struct LibraryCard: View {
                 onRemove(chosen, true)
             }
         }
+    }
+
+    private func handleTap() {
+        let now = Date()
+        if let lastTapAt, now.timeIntervalSince(lastTapAt) < 0.4 {
+            self.lastTapAt = nil
+            onSelect()
+            onOpen()
+            return
+        }
+        lastTapAt = now
+        onSelect()
     }
 }
 
